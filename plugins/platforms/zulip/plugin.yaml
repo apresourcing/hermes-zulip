@@ -1,0 +1,40 @@
+name: zulip-platform
+label: Zulip
+kind: platform
+version: 1.0.0
+description: Zulip gateway adapter for Hermes Agent using the Zulip Events API.
+author: Nous Research / contributor
+requires_env:
+  - name: ZULIP_SITE_URL
+    description: "Zulip organization URL, e.g. https://example.zulipchat.com"
+    prompt: "Zulip site URL"
+    password: false
+  - name: ZULIP_BOT_EMAIL
+    description: "Zulip bot email address"
+    prompt: "Zulip bot email"
+    password: false
+  - name: ZULIP_API_KEY
+    description: "Zulip bot API key"
+    prompt: "Zulip API key"
+    password: true
+optional_env:
+  - name: ZULIP_ALLOWED_EMAILS
+    description: "Comma-separated Zulip sender emails allowed to use Hermes"
+    prompt: "Allowed Zulip emails"
+    password: false
+  - name: ZULIP_ALLOWED_USER_IDS
+    description: "Comma-separated Zulip sender user IDs allowed to use Hermes"
+    prompt: "Allowed Zulip user IDs"
+    password: false
+  - name: ZULIP_HOME_EMAIL
+    description: "Default Zulip DM email for cron/background delivery"
+    prompt: "Zulip home DM email"
+    password: false
+  - name: ZULIP_HOME_USER_ID
+    description: "Default Zulip DM user ID for cron/background delivery"
+    prompt: "Zulip home DM user ID"
+    password: false
+  - name: ZULIP_MAX_MESSAGE_CHARS
+    description: "Optional maximum outbound Zulip message length before splitting"
+    prompt: "Zulip max message chars"
+    password: false
