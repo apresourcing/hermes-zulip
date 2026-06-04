@@ -56,6 +56,7 @@ class FakeAsyncClient:
         self.get_responses = list(get_responses or [])
         self.post_calls = []
         self.get_calls = []
+        self.delete_calls = []
         self.closed = False
         FakeAsyncClient.instances.append(self)
 
@@ -73,6 +74,15 @@ class FakeAsyncClient:
         if not self.get_responses:
             raise AssertionError("Unexpected GET")
         response = self.get_responses.pop(0)
+        if isinstance(response, BaseException):
+            raise response
+        return response
+
+    async def delete(self, url, **kwargs):
+        self.delete_calls.append((url, kwargs))
+        if not self.post_responses:
+            raise AssertionError("Unexpected DELETE")
+        response = self.post_responses.pop(0)
         if isinstance(response, BaseException):
             raise response
         return response
@@ -370,6 +380,115 @@ def test_register_calls_register_platform_with_zulip_hooks(adapter_module):
 
 
 @pytest.mark.asyncio
+async def test_send_exec_approval_posts_reaction_prompt_and_primes_reactions(adapter_module):
+    adapter = _make_adapter(adapter_module)
+    adapter._client = FakeAsyncClient(
+        post_responses=[
+            FakeResponse({"result": "success", "id": 2001}),
+            FakeResponse({"result": "success"}),
+            FakeResponse({"result": "success"}),
+            FakeResponse({"result": "success"}),
+        ]
+    )
+
+    result = await adapter.send_exec_approval(
+        chat_id="stream:42:topic:release%20plan",
+        command="rm -rf /tmp/example",
+        session_key="zulip:session:1",
+        description="dangerous command",
+        metadata={"zulip_stream_id": 42, "zulip_topic": "release plan"},
+    )
+
+    assert result.success is True
+    assert result.message_id == 2001
+    message_call = adapter._client.post_calls[0]
+    assert message_call[0] == "https://example.zulipchat.com/api/v1/messages"
+    content = message_call[1]["data"]["content"]
+    assert "👍 approve once" in content
+    assert "♾️ approve all" in content
+    assert "👎 reject" in content
+    assert "rm -rf /tmp/example" in content
+    assert adapter._approval_reactions["2001"] == {"session_key": "zulip:session:1"}
+    assert [call[1]["data"]["emoji_name"] for call in adapter._client.post_calls[1:]] == [
+        "thumbs_up",
+        "infinity",
+        "thumbs_down",
+    ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("emoji_name", "choice", "resolve_all"),
+    [
+        ("thumbs_up", "once", False),
+        ("thumbs_down", "deny", False),
+        ("infinity", "once", True),
+    ],
+)
+async def test_reaction_event_resolves_pending_exec_approval(
+    adapter_module,
+    monkeypatch,
+    emoji_name,
+    choice,
+    resolve_all,
+):
+    adapter = _make_recording_adapter(
+        adapter_module,
+        extra={"allowed_emails": [], "allowed_user_ids": ["123"]},
+    )
+    adapter._approval_reactions["2001"] = {"session_key": "zulip:session:1"}
+    calls = []
+
+    approval_module = types.ModuleType("tools.approval")
+    approval_module.resolve_gateway_approval = lambda session_key, picked, resolve_all=False: calls.append(
+        (session_key, picked, resolve_all)
+    ) or 1
+    tools_module = types.ModuleType("tools")
+    monkeypatch.setitem(sys.modules, "tools", tools_module)
+    monkeypatch.setitem(sys.modules, "tools.approval", approval_module)
+
+    await adapter._handle_zulip_reaction_event(
+        {
+            "id": 42,
+            "type": "reaction",
+            "op": "add",
+            "message_id": 2001,
+            "user_id": 123,
+            "emoji_name": emoji_name,
+        }
+    )
+
+    assert calls == [("zulip:session:1", choice, resolve_all)]
+    assert "2001" not in adapter._approval_reactions
+
+
+@pytest.mark.asyncio
+async def test_reaction_event_ignores_unauthorized_or_unknown_reactions(adapter_module, monkeypatch):
+    adapter = _make_recording_adapter(
+        adapter_module,
+        extra={"allowed_emails": [], "allowed_user_ids": ["123"]},
+    )
+    adapter._approval_reactions["2001"] = {"session_key": "zulip:session:1"}
+    calls = []
+    approval_module = types.ModuleType("tools.approval")
+    approval_module.resolve_gateway_approval = lambda *args, **kwargs: calls.append((args, kwargs)) or 1
+    monkeypatch.setitem(sys.modules, "tools.approval", approval_module)
+
+    await adapter._handle_zulip_reaction_event(
+        {"type": "reaction", "op": "add", "message_id": 2001, "user_id": 666, "emoji_name": "thumbs_up"}
+    )
+    await adapter._handle_zulip_reaction_event(
+        {"type": "reaction", "op": "add", "message_id": 2001, "user_id": 123, "emoji_name": "octopus"}
+    )
+    await adapter._handle_zulip_reaction_event(
+        {"type": "reaction", "op": "remove", "message_id": 2001, "user_id": 123, "emoji_name": "thumbs_up"}
+    )
+
+    assert calls == []
+    assert adapter._approval_reactions["2001"] == {"session_key": "zulip:session:1"}
+
+
+@pytest.mark.asyncio
 async def test_connect_registers_queue_stores_state_and_marks_connected(
     adapter_module, monkeypatch
 ):
@@ -401,7 +520,7 @@ async def test_connect_registers_queue_stores_state_and_marks_connected(
     assert client.post_calls == [
         (
             "https://example.zulipchat.com/api/v1/register",
-            {"data": {"event_types": '["message"]', "apply_markdown": "false"}},
+            {"data": {"event_types": '["message", "reaction"]', "apply_markdown": "false"}},
         )
     ]
     assert adapter.queue_id == "queue-1"
@@ -447,7 +566,7 @@ async def test_poll_once_ignores_non_message_events_and_advances_last_event_id(
                     "events": [
                         {"id": 42, "type": "heartbeat"},
                         {"id": 43, "type": "message", "message": {"id": 100}},
-                        {"id": 44, "type": "reaction"},
+                        {"id": 44, "type": "reaction", "op": "add", "message_id": 999, "emoji_name": "thumbs_up", "user_id": 123},
                     ],
                 }
             )
@@ -461,10 +580,17 @@ async def test_poll_once_ignores_non_message_events_and_advances_last_event_id(
         handled.append(event)
 
     adapter._handle_zulip_message_event = record_message_event
+    reactions = []
+
+    async def record_reaction_event(event):
+        reactions.append(event)
+
+    adapter._handle_zulip_reaction_event = record_reaction_event
 
     await adapter._poll_once()
 
     assert handled == [{"id": 43, "type": "message", "message": {"id": 100}}]
+    assert reactions == [{"id": 44, "type": "reaction", "op": "add", "message_id": 999, "emoji_name": "thumbs_up", "user_id": 123}]
     assert adapter.last_event_id == 44
     assert adapter._client.get_calls == [
         (

@@ -45,6 +45,26 @@ logger = logging.getLogger(__name__)
 UNAUTHORIZED_DM_MESSAGE = "You are not authorized to use this Hermes bot."
 MENTION_FLAGS = {"mentioned", "wildcard_mentioned"}
 DIRECT_MESSAGE_TYPES = {"direct", "private", "dm"}
+APPROVAL_REACTION_OPTIONS = (
+    ("thumbs_up", "👍", "approve once"),
+    ("infinity", "♾️", "approve all"),
+    ("thumbs_down", "👎", "reject"),
+)
+APPROVAL_REACTION_CHOICES = {
+    "thumbs_up": ("once", False),
+    "+1": ("once", False),
+    "1f44d": ("once", False),
+    "👍": ("once", False),
+    "thumbs_down": ("deny", False),
+    "-1": ("deny", False),
+    "1f44e": ("deny", False),
+    "👎": ("deny", False),
+    "infinity": ("once", True),
+    "267e": ("once", True),
+    "267e-fe0f": ("once", True),
+    "♾": ("once", True),
+    "♾️": ("once", True),
+}
 UNSUPPORTED_EVENT_OPS = {
     "delete",
     "deleted",
@@ -327,6 +347,7 @@ class ZulipAdapter(BasePlatformAdapter):
         self._client: Any | None = None
         self._poll_task: asyncio.Task | None = None
         self._stop_polling: asyncio.Event | None = None
+        self._approval_reactions: dict[str, dict[str, str]] = {}
 
     async def connect(self) -> bool:
         """Create the Zulip HTTP client, register an event queue, and start polling."""
@@ -406,6 +427,61 @@ class ZulipAdapter(BasePlatformAdapter):
             return _send_result(False, reason)
 
         return _send_result(True, message_id=last_message_id)
+
+
+    async def send_exec_approval(
+        self,
+        chat_id: str,
+        command: str,
+        session_key: str,
+        description: str = "dangerous command",
+        metadata: dict[str, Any] | None = None,
+    ) -> SendResult:
+        """Send a Zulip approval prompt resolved by emoji reactions.
+
+        Zulip does not expose Telegram-style inline buttons in the normal bot
+        message API. Reactions are reliable across Zulip clients, so this
+        method posts a prompt, primes it with the three reaction options, and
+        resolves the pending Hermes approval when an authorized user reacts.
+        """
+        cmd_preview = command[:200] + "..." if len(command) > 200 else command
+        options = " | ".join(f"{emoji} {label}" for _, emoji, label in APPROVAL_REACTION_OPTIONS)
+        content = (
+            "⚠️ **Dangerous command requires approval:**\n"
+            f"```\n{cmd_preview}\n```\n"
+            f"Reason: {description}\n\n"
+            f"React: {options}\n"
+            "Text fallback: `/approve`, `/approve all`, or `/deny`."
+        )
+        result = await self.send(chat_id, content, metadata=metadata)
+        if not getattr(result, "success", False):
+            return result
+
+        message_id = getattr(result, "message_id", None)
+        if message_id is not None:
+            self._approval_reactions[str(message_id)] = {"session_key": session_key}
+            await self._prime_approval_reactions(message_id)
+        return result
+
+    async def _prime_approval_reactions(self, message_id: Any) -> None:
+        if self._client is None:
+            return
+        for emoji_name, _emoji, _label in APPROVAL_REACTION_OPTIONS:
+            try:
+                response = await self._client.post(
+                    f"{self.api_base}/messages/{message_id}/reactions",
+                    data={"emoji_name": emoji_name},
+                )
+                self._raise_for_status(response)
+                body = response.json()
+                if body.get("result") == "error" and body.get("code") != "REACTION_ALREADY_EXISTS":
+                    logger.debug(
+                        "Zulip approval reaction prime failed for %s: %s",
+                        emoji_name,
+                        body.get("msg") or body.get("code") or "unknown error",
+                    )
+            except Exception as exc:
+                logger.debug("Zulip approval reaction prime failed for %s: %s", emoji_name, _short_error(exc))
 
     async def send_typing(self, chat_id: str, metadata: dict[str, Any] | None = None) -> None:
         """Show Zulip's native typing indicator for the target conversation."""
@@ -496,7 +572,7 @@ class ZulipAdapter(BasePlatformAdapter):
 
         response = await self._client.post(
             f"{self.api_base}/register",
-            data={"event_types": json.dumps(["message"]), "apply_markdown": "false"},
+            data={"event_types": json.dumps(["message", "reaction"]), "apply_markdown": "false"},
         )
         self._raise_for_status(response)
         payload = response.json()
@@ -573,9 +649,11 @@ class ZulipAdapter(BasePlatformAdapter):
             ):
                 highest_event_id = event_id
 
-            if event.get("type") != "message":
-                continue
-            await self._handle_zulip_message_event(event)
+            event_type = event.get("type")
+            if event_type == "message":
+                await self._handle_zulip_message_event(event)
+            elif event_type == "reaction":
+                await self._handle_zulip_reaction_event(event)
 
         self.last_event_id = highest_event_id
 
@@ -621,6 +699,85 @@ class ZulipAdapter(BasePlatformAdapter):
 
         event_obj = self._build_message_event(message, content, is_dm=is_dm)
         await self.handle_message(event_obj)
+
+
+    async def _handle_zulip_reaction_event(self, event: dict[str, Any]) -> None:
+        """Resolve pending Hermes approvals from authorized Zulip reactions."""
+        op = _clean_text(event.get("op") or event.get("operation")).lower()
+        if op and op not in {"add", "add_reaction"}:
+            return
+
+        message_id = _clean_text(event.get("message_id"))
+        state = self._approval_reactions.get(message_id)
+        if not state:
+            return
+        if self._is_self_reaction(event) or not self._is_authorized_reaction(event):
+            return
+
+        reaction_key = self._reaction_key(event)
+        choice = APPROVAL_REACTION_CHOICES.get(reaction_key)
+        if choice is None:
+            return
+
+        approval_choice, resolve_all = choice
+        try:
+            from tools.approval import resolve_gateway_approval
+            count = resolve_gateway_approval(
+                state["session_key"],
+                approval_choice,
+                resolve_all=resolve_all,
+            )
+        except Exception as exc:
+            logger.warning("Zulip approval reaction resolve failed: %s", _short_error(exc))
+            return
+
+        if count:
+            self._approval_reactions.pop(message_id, None)
+            logger.info(
+                "Zulip reaction resolved %d approval(s) for session %s",
+                count,
+                state["session_key"],
+            )
+
+    def _is_authorized_reaction(self, event: dict[str, Any]) -> bool:
+        if not self.allowed_emails and not self.allowed_user_ids:
+            return False
+
+        raw_user = event.get("user")
+        user = raw_user if isinstance(raw_user, dict) else {}
+        email = _clean_text(
+            event.get("user_email")
+            or event.get("email")
+            or user.get("email")
+        ).lower()
+        user_id = event.get("user_id") or user.get("user_id") or user.get("id")
+        if user_id is None and not isinstance(raw_user, dict):
+            user_id = raw_user
+        return (
+            bool(email and email in self.allowed_emails)
+            or bool(user_id is not None and str(user_id) in self.allowed_user_ids)
+        )
+
+    def _is_self_reaction(self, event: dict[str, Any]) -> bool:
+        raw_user = event.get("user")
+        user = raw_user if isinstance(raw_user, dict) else {}
+        email = _clean_text(
+            event.get("user_email") or event.get("email") or user.get("email")
+        ).lower()
+        if email and email == self.bot_email.lower():
+            return True
+        user_id = event.get("user_id") or user.get("user_id") or user.get("id")
+        return bool(
+            user_id is not None and self.bot_user_id and str(user_id) == self.bot_user_id
+        )
+
+    @staticmethod
+    def _reaction_key(event: dict[str, Any]) -> str:
+        for key in ("emoji_name", "emoji_code", "emoji", "name"):
+            value = _clean_text(event.get(key)).lower()
+            if value:
+                return value.replace(" ", "_")
+        return ""
 
     async def _sleep_after_poll_error(self) -> None:
         if self._stop_polling is None:
