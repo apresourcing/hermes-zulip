@@ -7,12 +7,14 @@ import contextlib
 import importlib.util
 import json
 import logging
+import mimetypes
 import os
 import re
 from html import unescape
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
-from urllib.parse import quote, unquote
+from urllib.parse import quote, unquote, urljoin, urlparse
 
 from gateway.config import Platform, PlatformConfig
 from gateway.platforms.base import (
@@ -34,6 +36,26 @@ except ImportError:  # pragma: no cover - check_requirements reports this cleanl
 
 
 DEFAULT_MAX_MESSAGE_CHARS = 8000
+DEFAULT_ATTACHMENT_MAX_BYTES = 25_000_000
+DEFAULT_ATTACHMENT_MAX_COUNT = 5
+DEFAULT_ATTACHMENT_ALLOWED_EXTS = {
+    ".png",
+    ".jpg",
+    ".jpeg",
+    ".webp",
+    ".gif",
+    ".pdf",
+    ".txt",
+    ".md",
+    ".csv",
+    ".json",
+    ".yaml",
+    ".yml",
+    ".xml",
+    ".docx",
+    ".xlsx",
+    ".pptx",
+}
 DEFAULT_LONGPOLL_TIMEOUT_SECONDS = 90
 POLL_ERROR_SLEEP_SECONDS = 5
 REQUIRED_ENV = ["ZULIP_SITE_URL", "ZULIP_BOT_EMAIL", "ZULIP_API_KEY"]
@@ -78,6 +100,11 @@ UNSUPPORTED_EVENT_OPS = {
 LEADING_ZULIP_MENTION_RE = re.compile(
     r"^\s*@\*\*(?P<name>[^*]+)\*\*\s*:?\s*",
     re.UNICODE,
+)
+HREF_RE = re.compile(r"href=[\"'](?P<href>[^\"']+)[\"']", re.IGNORECASE)
+USER_UPLOAD_LINK_RE = re.compile(
+    r"(?P<href>(?:https?://[^\s)'\"]+)?/user_uploads/[^\s)'\"]+)",
+    re.IGNORECASE,
 )
 
 
@@ -163,6 +190,33 @@ def _read_configured_max_message_chars(config: Any) -> int | None:
     parsed = _parse_positive_int(_extra(config).get("max_message_chars"))
     return parsed
 
+
+def _read_attachment_max_bytes(config: Any) -> int:
+    env_value = os.environ.get("ZULIP_ATTACHMENT_MAX_BYTES")
+    if env_value is not None:
+        parsed = _parse_positive_int(env_value)
+        if parsed is not None:
+            return parsed
+    parsed = _parse_positive_int(_extra(config).get("attachment_max_bytes"))
+    return parsed if parsed is not None else DEFAULT_ATTACHMENT_MAX_BYTES
+
+
+def _read_attachment_max_count(config: Any) -> int:
+    env_value = os.environ.get("ZULIP_ATTACHMENT_MAX_COUNT")
+    if env_value is not None:
+        parsed = _parse_positive_int(env_value)
+        if parsed is not None:
+            return parsed
+    parsed = _parse_positive_int(_extra(config).get("attachment_max_count"))
+    return parsed if parsed is not None else DEFAULT_ATTACHMENT_MAX_COUNT
+
+
+def _read_attachment_allowed_exts(config: Any) -> set[str]:
+    value = _read_setting(config, "ZULIP_ATTACHMENT_ALLOWED_EXTS", "attachment_allowed_exts")
+    values = _split_values(value, lowercase=True)
+    if not values:
+        return set(DEFAULT_ATTACHMENT_ALLOWED_EXTS)
+    return {item if item.startswith(".") else f".{item}" for item in values}
 
 
 def _read_legacy_home_target(config: Any) -> tuple[str | None, str | None]:
@@ -337,6 +391,9 @@ class ZulipAdapter(BasePlatformAdapter):
             _read_configured_max_message_chars(config) is not None
         )
         self.max_message_chars = _read_max_message_chars(config)
+        self.attachment_max_bytes = _read_attachment_max_bytes(config)
+        self.attachment_max_count = _read_attachment_max_count(config)
+        self.attachment_allowed_exts = _read_attachment_allowed_exts(config)
         self.max_message_length: int | None = None
         self.queue_id: str | None = None
         self.last_event_id: int | None = None
@@ -679,7 +736,17 @@ class ZulipAdapter(BasePlatformAdapter):
             if not invoked:
                 return
 
-        event_obj = self._build_message_event(message, content, is_dm=is_dm)
+        attachments = await self._materialize_message_attachments(message, content)
+        if attachments["summaries"]:
+            content = "\n".join([content, *attachments["summaries"]]).strip()
+
+        event_obj = self._build_message_event(
+            message,
+            content,
+            is_dm=is_dm,
+            media_urls=attachments["media_urls"],
+            media_types=attachments["media_types"],
+        )
         await self.handle_message(event_obj)
 
 
@@ -951,12 +1018,101 @@ class ZulipAdapter(BasePlatformAdapter):
                 return True
         return False
 
+    async def _materialize_message_attachments(
+        self,
+        message: dict[str, Any],
+        content: str,
+    ) -> dict[str, list[str]]:
+        media_urls: list[str] = []
+        media_types: list[str] = []
+        summaries: list[str] = []
+        if self._client is None or self.attachment_max_count <= 0:
+            return {"media_urls": media_urls, "media_types": media_types, "summaries": summaries}
+
+        message_id = _clean_text(message.get("id")) or "unknown"
+        for attachment in self._zulip_upload_links(content)[: self.attachment_max_count]:
+            filename = self._safe_attachment_filename(attachment)
+            ext = Path(filename).suffix.lower()
+            if ext not in self.attachment_allowed_exts:
+                summaries.append(f"[Attachment skipped: {filename} extension is not allowed]")
+                continue
+
+            try:
+                response = await self._client.get(attachment, follow_redirects=True)
+                self._raise_for_status(response)
+            except Exception as exc:
+                summaries.append(f"[Attachment skipped: {filename} download failed: {_short_error(exc)}]")
+                continue
+
+            body = getattr(response, "content", b"") or b""
+            if isinstance(body, str):
+                body = body.encode()
+            size = len(body)
+            header_size = _parse_positive_int((getattr(response, "headers", {}) or {}).get("content-length"))
+            effective_size = header_size if header_size is not None else size
+            if effective_size > self.attachment_max_bytes or size > self.attachment_max_bytes:
+                summaries.append(f"[Attachment skipped: {filename} exceeds {self.attachment_max_bytes} bytes]")
+                continue
+
+            target_dir = self._attachment_cache_dir(message_id)
+            target_dir.mkdir(parents=True, exist_ok=True)
+            target_path = target_dir / filename
+            target_path.write_bytes(body)
+            media_type = self._attachment_media_type(filename, response)
+            media_urls.append(str(target_path))
+            media_types.append(media_type)
+            summaries.append(f"[Attachment: {filename}] {target_path}")
+
+        return {"media_urls": media_urls, "media_types": media_types, "summaries": summaries}
+
+    def _zulip_upload_links(self, content: str) -> list[str]:
+        links: list[str] = []
+        raw_hrefs = [match.group("href") for match in HREF_RE.finditer(content)]
+        raw_hrefs.extend(match.group("href") for match in USER_UPLOAD_LINK_RE.finditer(content))
+        for raw_href in raw_hrefs:
+            href = unescape(raw_href)
+            absolute = urljoin(f"{self.site_url}/", href)
+            parsed = urlparse(absolute)
+            site = urlparse(self.site_url)
+            if parsed.scheme not in {"http", "https"}:
+                continue
+            if parsed.netloc != site.netloc:
+                continue
+            if not parsed.path.startswith("/user_uploads/"):
+                continue
+            if absolute not in links:
+                links.append(absolute)
+        return links
+
+    def _safe_attachment_filename(self, url: str) -> str:
+        parsed = urlparse(url)
+        raw_name = unquote(Path(parsed.path).name) or "attachment"
+        safe_name = re.sub(r"[^A-Za-z0-9._-]+", "_", raw_name).strip("._")
+        return safe_name or "attachment"
+
+    @staticmethod
+    def _attachment_cache_dir(message_id: str) -> Path:
+        safe_message_id = re.sub(r"[^A-Za-z0-9._-]+", "_", message_id).strip("._") or "unknown"
+        hermes_home = Path(os.environ.get("HERMES_HOME") or str(Path.home() / ".hermes"))
+        return hermes_home / "gateway" / "incoming" / "zulip" / safe_message_id
+
+    @staticmethod
+    def _attachment_media_type(filename: str, response: Any) -> str:
+        headers = getattr(response, "headers", {}) or {}
+        content_type = _clean_text(headers.get("content-type")).split(";", 1)[0]
+        if content_type:
+            return content_type
+        guessed, _ = mimetypes.guess_type(filename)
+        return guessed or "application/octet-stream"
+
     def _build_message_event(
         self,
         message: dict[str, Any],
         content: str,
         *,
         is_dm: bool,
+        media_urls: list[str] | None = None,
+        media_types: list[str] | None = None,
     ) -> MessageEvent:
         chat_id = self._dm_chat_id(message) if is_dm else self._stream_chat_id(message)
         chat_name = self._dm_chat_name(message) if is_dm else self._stream_chat_name(message)
@@ -972,28 +1128,38 @@ class ZulipAdapter(BasePlatformAdapter):
             metadata=metadata,
         )
         message_type = _message_type_text()
+        media_urls = media_urls or []
+        media_types = media_types or []
 
         candidates = [
             {
                 "content": content,
                 "message_type": message_type,
                 "source": source,
+                "media_urls": media_urls,
+                "media_types": media_types,
             },
             {
                 "content": content,
                 "type": message_type,
                 "source": source,
+                "media_urls": media_urls,
+                "media_types": media_types,
             },
             {
                 "text": content,
                 "message_type": message_type,
                 "source": source,
+                "media_urls": media_urls,
+                "media_types": media_types,
             },
             {
                 "platform": "zulip",
                 "content": content,
                 "message_type": message_type,
                 "source": source,
+                "media_urls": media_urls,
+                "media_types": media_types,
             },
         ]
         for kwargs in candidates:
@@ -1001,7 +1167,14 @@ class ZulipAdapter(BasePlatformAdapter):
                 return MessageEvent(**kwargs)
             except Exception:
                 continue
-        return SimpleNamespace(content=content, message_type=message_type, type=message_type, source=source)
+        return SimpleNamespace(
+            content=content,
+            message_type=message_type,
+            type=message_type,
+            source=source,
+            media_urls=media_urls,
+            media_types=media_types,
+        )
 
     def _build_source_payload(
         self,
