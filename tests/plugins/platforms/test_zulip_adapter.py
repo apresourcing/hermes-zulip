@@ -15,6 +15,7 @@ ZULIP_ENV = {
     "ZULIP_ALLOWED_USER_IDS",
     "ZULIP_HOME_EMAIL",
     "ZULIP_HOME_USER_ID",
+    "ZULIP_HOME_CHANNEL",
     "ZULIP_MAX_MESSAGE_CHARS",
 }
 
@@ -215,6 +216,20 @@ def test_adapter_initialization_uses_config_extra_as_fallback(adapter_module):
     assert adapter.max_message_chars == 2048
 
 
+def test_adapter_initialization_prefers_generic_home_channel(adapter_module, monkeypatch):
+    _set_base_env(monkeypatch)
+    monkeypatch.setenv("ZULIP_HOME_CHANNEL", "stream:607312:topic:Canvas%20feasibility")
+    monkeypatch.setenv("ZULIP_HOME_EMAIL", "Owner@Example.com")
+
+    adapter = adapter_module.ZulipAdapter(FakePlatformConfig())
+
+    assert adapter.home_email == "Owner@Example.com"
+    assert adapter.home_channel == {
+        "chat_id": "stream:607312:topic:Canvas%20feasibility",
+        "name": "Zulip Home",
+    }
+
+
 def test_check_requirements_false_without_base_credentials(adapter_module):
     assert adapter_module.check_requirements() is False
 
@@ -307,6 +322,18 @@ def test_env_enablement_seeds_user_id_home_channel(adapter_module, monkeypatch):
     assert "max_message_chars" not in extras
 
 
+def test_env_enablement_seeds_generic_home_channel(adapter_module, monkeypatch):
+    _set_base_env(monkeypatch)
+    monkeypatch.setenv("ZULIP_HOME_CHANNEL", "stream:607312:topic:Canvas%20feasibility")
+
+    extras = adapter_module._env_enablement()
+
+    assert extras["home_channel"] == {
+        "chat_id": "stream:607312:topic:Canvas%20feasibility",
+        "name": "Zulip Home",
+    }
+
+
 def test_register_calls_register_platform_with_zulip_hooks(adapter_module):
     class FakeRegistryContext:
         def __init__(self):
@@ -334,8 +361,8 @@ def test_register_calls_register_platform_with_zulip_hooks(adapter_module):
         "ZULIP_API_KEY",
     ]
     assert registration["env_enablement_fn"] is adapter_module._env_enablement
-    assert registration["cron_deliver_env_var"] == "ZULIP_HOME_EMAIL"
-    assert registration["allowed_users_env"] == "ZULIP_ALLOWED_EMAILS"
+    assert registration["cron_deliver_env_var"] == "ZULIP_HOME_CHANNEL"
+    assert registration["allowed_users_env"] == "ZULIP_ALLOWED_USER_IDS"
     assert registration["max_message_length"] == 8000
     assert "Zulip supports Markdown" in registration["platform_hint"]
     assert registration["emoji"]
@@ -374,7 +401,7 @@ async def test_connect_registers_queue_stores_state_and_marks_connected(
     assert client.post_calls == [
         (
             "https://example.zulipchat.com/api/v1/register",
-            {"data": {"event_types": ["message"], "apply_markdown": "false"}},
+            {"data": {"event_types": '["message"]', "apply_markdown": "false"}},
         )
     ]
     assert adapter.queue_id == "queue-1"
@@ -638,7 +665,7 @@ async def test_unauthorized_dm_sends_denial(adapter_module):
     )
 
     assert adapter.events == []
-    assert sent[0][0] == "dm:555"
+    assert sent[0][0] == "dm:666"
     assert sent[0][1] == adapter_module.UNAUTHORIZED_DM_MESSAGE
 
 
@@ -695,7 +722,7 @@ async def test_missing_allowlist_fails_closed_and_logs_no_message_body_or_api_ke
 
     assert adapter.events == []
     assert len(sent) == 1
-    assert sent[0][0] == "dm:555"
+    assert sent[0][0] == "dm:123"
     assert sent[0][1] == adapter_module.UNAUTHORIZED_DM_MESSAGE
     assert sent[0][2]["zulip_sender_email"] == "alice@example.com"
     assert "private request body" not in caplog.text
@@ -711,17 +738,21 @@ async def test_dm_message_and_slash_command_are_accepted(adapter_module):
     await adapter._handle_zulip_message_event(_message_event(_base_message(id=1002, content="/status")))
 
     assert [event.content for event in adapter.events] == ["hello", "/status"]
-    assert [_event_source(event)["chat_id"] for event in adapter.events] == ["dm:555", "dm:555"]
+    assert [_event_source(event)["chat_id"] for event in adapter.events] == ["dm:123", "dm:123"]
 
 
 @pytest.mark.asyncio
-async def test_stream_without_mention_and_bare_slash_command_are_ignored(adapter_module):
+async def test_stream_without_mention_and_bare_slash_command_are_accepted(adapter_module):
     adapter = _make_recording_adapter(adapter_module)
 
     await adapter._handle_zulip_message_event(_message_event(_stream_message(content="hello")))
     await adapter._handle_zulip_message_event(_message_event(_stream_message(id=1002, content="/status")))
 
-    assert adapter.events == []
+    assert [event.content for event in adapter.events] == ["hello", "/status"]
+    assert [_event_source(event)["chat_id"] for event in adapter.events] == [
+        "stream:42:topic:release%20plan",
+        "stream:42:topic:release%20plan",
+    ]
 
 
 @pytest.mark.asyncio
@@ -753,7 +784,7 @@ async def test_stream_with_mention_is_accepted_and_leading_mention_stripped(adap
 
 
 @pytest.mark.asyncio
-async def test_stream_slash_command_requires_mention(adapter_module):
+async def test_stream_slash_command_strips_leading_mention(adapter_module):
     adapter = _make_recording_adapter(adapter_module)
 
     await adapter._handle_zulip_message_event(
@@ -809,8 +840,8 @@ def test_dm_chat_ids_are_stable_and_distinct_from_streams(adapter_module):
         )
     )
 
-    assert same_a == same_b == "dm:555"
-    assert sorted_group_dm == "dm:123,99"
+    assert same_a == same_b == "dm:123"
+    assert sorted_group_dm == "dm:123"
     assert not same_a.startswith("stream:")
 
 
@@ -852,7 +883,7 @@ async def test_send_stream_uses_metadata_payload_and_returns_last_message_id(ada
             {
                 "data": {
                     "type": "stream",
-                    "to": 42,
+                    "to": "42",
                     "topic": "release plan",
                     "content": "hello stream",
                 }
@@ -873,7 +904,7 @@ async def test_send_stream_falls_back_to_canonical_chat_id(adapter_module):
     assert result.success is True
     assert adapter._client.post_calls[0][1]["data"] == {
         "type": "stream",
-        "to": 42,
+        "to": "42",
         "topic": "release plan",
         "content": "hello",
     }
@@ -902,7 +933,7 @@ async def test_send_home_dm_chat_ids_route_to_direct_targets(
     assert result.success is True
     assert adapter._client.post_calls[0][1]["data"] == {
         "type": "direct",
-        "to": expected_to,
+        "to": adapter_module.json.dumps(expected_to),
         "content": "home delivery",
     }
 
@@ -923,7 +954,7 @@ async def test_send_dm_uses_metadata_sender_before_canonical_chat_id(adapter_mod
     assert result.success is True
     assert adapter._client.post_calls[0][1]["data"] == {
         "type": "direct",
-        "to": [123],
+        "to": "[123]",
         "content": "reply",
     }
 
@@ -1039,7 +1070,7 @@ async def test_standalone_sender_uses_home_dm_and_closes_client(adapter_module, 
             {
                 "data": {
                     "type": "direct",
-                    "to": ["owner@example.com"],
+                    "to": '["owner@example.com"]',
                     "content": "cron message",
                 }
             },

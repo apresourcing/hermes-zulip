@@ -40,14 +40,19 @@ requirement. Runtime behavior is fail closed: if both `ZULIP_ALLOWED_EMAILS` and
 
 Optional:
 
-- `ZULIP_HOME_EMAIL`: Zulip DM email target for home, cron, or background delivery.
-- `ZULIP_HOME_USER_ID`: Zulip DM user ID target for home, cron, or background delivery.
+- `ZULIP_HOME_CHANNEL`: Zulip chat target for home, cron, or background delivery.
+  This is the value saved by `/sethome`, e.g. `dm_user:12345` or
+  `stream:607312:topic:Canvas%20feasibility`.
+- `ZULIP_HOME_EMAIL`: legacy Zulip DM email target for home, cron, or background
+  delivery when `ZULIP_HOME_CHANNEL` is unset.
+- `ZULIP_HOME_USER_ID`: legacy Zulip DM user ID target for home, cron, or
+  background delivery when `ZULIP_HOME_CHANNEL` is unset.
 - `ZULIP_MAX_MESSAGE_CHARS`: outbound message split limit. When unset, the adapter
   uses Zulip's registered `max_message_length` when available, otherwise a safe
   default.
 
-Home delivery is DM-only. If neither home variable is configured, inbound Zulip
-still works, but default Zulip delivery has no home target.
+If no home variable is configured, inbound Zulip still works, but default Zulip
+delivery has no home target.
 
 ## Behavior
 
@@ -56,8 +61,9 @@ still works, but default Zulip delivery has no home target.
 - Registers a Zulip Events API queue for message events and polls it with long
   polling.
 - Accepts DMs from allowed Zulip users.
-- Accepts stream/topic messages only when the bot is mentioned, or when supported
-  event metadata identifies the message as a direct reply to a Hermes bot message.
+- Accepts stream/topic messages from allowed Zulip users without requiring an
+  `@Hermes` mention. If an invocation starts with a bot mention, the adapter
+  strips it before handing the message to Hermes.
 - Maps each Zulip stream plus topic to a separate Hermes conversation. Different
   topics in the same stream do not share context.
 - Sends and receives Markdown text only.
@@ -65,7 +71,7 @@ still works, but default Zulip delivery has no home target.
   moving the reply elsewhere.
 - Does not replay backlog after adapter restart. A fresh Events API queue is
   registered and only new events are processed.
-- Delivers home, cron, and standalone sends to a configured Zulip DM target only.
+- Delivers home, cron, and standalone sends to the configured Zulip target.
 
 Unauthorized DMs receive a short denial message. Unauthorized stream messages are
 ignored without posting to the stream.
