@@ -339,6 +339,7 @@ def test_register_calls_register_platform_with_zulip_hooks(adapter_module):
     assert registration["max_message_length"] == 8000
     assert "Zulip supports Markdown" in registration["platform_hint"]
     assert registration["emoji"]
+    assert registration["standalone_sender_fn"] is adapter_module._standalone_send
 
 
 @pytest.mark.asyncio
@@ -755,3 +756,208 @@ async def test_direct_reply_metadata_accepts_stream_message_without_mention(adap
     )
 
     assert [event.content for event in adapter.events] == ["following up"]
+
+
+@pytest.mark.asyncio
+async def test_send_stream_uses_metadata_payload_and_returns_last_message_id(adapter_module):
+    adapter = _make_adapter(adapter_module)
+    adapter._client = FakeAsyncClient(
+        post_responses=[
+            FakeResponse({"result": "success", "id": 100}),
+        ]
+    )
+
+    result = await adapter.send(
+        "stream:ignored:topic:ignored",
+        "hello stream",
+        metadata={
+            "zulip_stream_id": 42,
+            "zulip_stream_name": "engineering",
+            "zulip_topic": "release plan",
+        },
+    )
+
+    assert result.success is True
+    assert result.message_id == 100
+    assert adapter._client.post_calls == [
+        (
+            "https://example.zulipchat.com/api/v1/messages",
+            {
+                "data": {
+                    "type": "stream",
+                    "to": 42,
+                    "topic": "release plan",
+                    "content": "hello stream",
+                }
+            },
+        )
+    ]
+
+
+@pytest.mark.asyncio
+async def test_send_stream_falls_back_to_canonical_chat_id(adapter_module):
+    adapter = _make_adapter(adapter_module)
+    adapter._client = FakeAsyncClient(
+        post_responses=[FakeResponse({"result": "success", "id": 101})]
+    )
+
+    result = await adapter.send("stream:42:topic:release%20plan", "hello")
+
+    assert result.success is True
+    assert adapter._client.post_calls[0][1]["data"] == {
+        "type": "stream",
+        "to": 42,
+        "topic": "release plan",
+        "content": "hello",
+    }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("chat_id", "expected_to"),
+    [
+        ("dm_user:123", [123]),
+        ("dm_email:owner@example.com", ["owner@example.com"]),
+    ],
+)
+async def test_send_home_dm_chat_ids_route_to_direct_targets(
+    adapter_module,
+    chat_id,
+    expected_to,
+):
+    adapter = _make_adapter(adapter_module)
+    adapter._client = FakeAsyncClient(
+        post_responses=[FakeResponse({"result": "success", "id": 102})]
+    )
+
+    result = await adapter.send(chat_id, "home delivery")
+
+    assert result.success is True
+    assert adapter._client.post_calls[0][1]["data"] == {
+        "type": "direct",
+        "to": expected_to,
+        "content": "home delivery",
+    }
+
+
+@pytest.mark.asyncio
+async def test_send_dm_uses_metadata_sender_before_canonical_chat_id(adapter_module):
+    adapter = _make_adapter(adapter_module)
+    adapter._client = FakeAsyncClient(
+        post_responses=[FakeResponse({"result": "success", "id": 103})]
+    )
+
+    result = await adapter.send(
+        "dm:555",
+        "reply",
+        metadata={"zulip_sender_id": 123, "zulip_sender_email": "alice@example.com"},
+    )
+
+    assert result.success is True
+    assert adapter._client.post_calls[0][1]["data"] == {
+        "type": "direct",
+        "to": [123],
+        "content": "reply",
+    }
+
+
+@pytest.mark.asyncio
+async def test_send_splits_long_content_without_part_prefixes(adapter_module):
+    adapter = _make_adapter(adapter_module)
+    adapter.max_message_chars = 12
+    adapter._client = FakeAsyncClient(
+        post_responses=[
+            FakeResponse({"result": "success", "id": 1}),
+            FakeResponse({"result": "success", "id": 2}),
+        ]
+    )
+
+    result = await adapter.send("dm_user:123", "first\n\nsecond")
+
+    assert result.success is True
+    assert result.message_id == 2
+    contents = [call[1]["data"]["content"] for call in adapter._client.post_calls]
+    assert contents == ["first\n\n", "second"]
+    assert all("part" not in content.lower() for content in contents)
+    assert all(len(content) <= 12 for content in contents)
+
+
+def test_split_message_hard_splits_oversized_paragraph(adapter_module):
+    chunks = adapter_module._split_message("abcdefghijklmnop", 5)
+
+    assert chunks == ["abcde", "fghij", "klmno", "p"]
+    assert all(len(chunk) <= 5 for chunk in chunks)
+
+
+def test_split_message_keeps_fenced_code_block_together_when_possible(adapter_module):
+    content = "intro\n\n```python\nprint('hi')\n```\n\noutro"
+    chunks = adapter_module._split_message(content, 30)
+
+    assert "```python\nprint('hi')\n```\n\n" in chunks
+    assert all(len(chunk) <= 30 for chunk in chunks)
+
+
+@pytest.mark.asyncio
+async def test_send_zulip_error_returns_failure_and_stops(adapter_module):
+    adapter = _make_adapter(adapter_module)
+    adapter.max_message_chars = 3
+    adapter._client = FakeAsyncClient(
+        post_responses=[
+            FakeResponse({"result": "success", "id": 1}),
+            FakeResponse({"result": "error", "msg": "too long"}),
+            FakeResponse({"result": "success", "id": 3}),
+        ]
+    )
+
+    result = await adapter.send("dm_user:123", "abcdefghi")
+
+    assert result.success is False
+    assert result.error == "too long"
+    assert len(adapter._client.post_calls) == 2
+
+
+@pytest.mark.asyncio
+async def test_send_http_exception_returns_failure(adapter_module):
+    adapter = _make_adapter(adapter_module)
+    adapter._client = FakeAsyncClient(post_responses=[RuntimeError("network down")])
+
+    result = await adapter.send("dm_user:123", "hello")
+
+    assert result.success is False
+    assert result.error == "network down"
+    assert len(adapter._client.post_calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_standalone_sender_uses_home_dm_and_closes_client(adapter_module, monkeypatch):
+    _patch_httpx_client(
+        adapter_module,
+        monkeypatch,
+        post_responses=[FakeResponse({"result": "success", "id": 777})],
+    )
+    config = FakePlatformConfig(
+        extra={
+            "site_url": "https://example.zulipchat.com/",
+            "bot_email": "bot@example.com",
+            "api_key": "secret",
+            "home_email": "owner@example.com",
+        }
+    )
+
+    result = await adapter_module._standalone_send(config, None, "cron message")
+
+    client = FakeAsyncClient.instances[0]
+    assert result == {"success": True, "message_id": 777}
+    assert client.closed is True
+    assert client.post_calls == [
+        (
+            "https://example.zulipchat.com/api/v1/messages",
+            {
+                "data": {
+                    "type": "direct",
+                    "to": ["owner@example.com"],
+                    "content": "cron message",
+                }
+            },
+        )
+    ]
