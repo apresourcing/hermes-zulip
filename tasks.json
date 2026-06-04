@@ -12,7 +12,29 @@
       "complexityScore": 3,
       "recommendedSubtasks": 2,
       "expansionPrompt": "Break this into creating the plugin directory and plugin.yaml metadata, then validating the YAML and env var coverage against the PRD.",
-      "reasoning": "Low implementation complexity because this is mostly static plugin metadata with no runtime code. The main risk is matching Hermes plugin discovery conventions and representing mutually exclusive allowlist variables clearly while avoiding unsupported configuration fields. Testing is limited to YAML parsing and metadata assertions."
+      "reasoning": "Low implementation complexity because this is mostly static plugin metadata with no runtime code. The main risk is matching Hermes plugin discovery conventions and representing mutually exclusive allowlist variables clearly while avoiding unsupported configuration fields. Testing is limited to YAML parsing and metadata assertions.",
+      "subtasks": [
+        {
+          "id": 1,
+          "title": "Create Zulip plugin directory and metadata file",
+          "description": "Create the upstream-shaped Zulip platform plugin folder and plugin.yaml metadata file.",
+          "dependencies": [],
+          "details": "Add plugins/platforms/zulip/plugin.yaml using the checkout convention and define the platform name, label, kind, version, description, and author without touching Hermes core files.",
+          "status": "pending",
+          "testStrategy": "Confirm the expected plugin path exists and plugin.yaml can be loaded by the project YAML parser."
+        },
+        {
+          "id": 2,
+          "title": "Validate metadata env var coverage and exclusions",
+          "description": "Verify the metadata exposes required and optional Zulip environment variables only.",
+          "dependencies": [
+            1
+          ],
+          "details": "Assert requires_env contains ZULIP_SITE_URL, ZULIP_BOT_EMAIL, and ZULIP_API_KEY, optional_env contains allowlist, home, and max-length vars, and unsupported webhook, config-file, media, or admin fields are absent.",
+          "status": "pending",
+          "testStrategy": "Add or run a metadata-focused test that parses plugin.yaml and checks kind, label, env var names, password flags, and unsupported field absence."
+        }
+      ]
     },
     {
       "id": 2,
@@ -26,7 +48,53 @@
       "complexityScore": 6,
       "recommendedSubtasks": 4,
       "expansionPrompt": "Split into config parsing and normalization, requirement and config validation helpers, env enablement and home channel seeding, and register(ctx) integration with Hermes platform hooks.",
-      "reasoning": "Moderate complexity due to needing exact imports and registration signatures from the target Hermes checkout, careful env precedence, canonical home chat IDs, and fail-closed allowlist behavior that is enforced inbound rather than during config validation. Tests need monkeypatched env and a fake registry but no external service."
+      "reasoning": "Moderate complexity due to needing exact imports and registration signatures from the target Hermes checkout, careful env precedence, canonical home chat IDs, and fail-closed allowlist behavior that is enforced inbound rather than during config validation. Tests need monkeypatched env and a fake registry but no external service.",
+      "subtasks": [
+        {
+          "id": 1,
+          "title": "Implement environment parsing and adapter initialization",
+          "description": "Add ZulipAdapter initialization that normalizes credentials, allowlists, home targets, and message limits.",
+          "dependencies": [],
+          "details": "Read os.environ first and config.extra second for site_url, bot_email, api_key, allowed_emails, allowed_user_ids, home target, and ZULIP_MAX_MESSAGE_CHARS, normalizing URLs, lowercasing emails, and storing user IDs as strings.",
+          "status": "pending",
+          "testStrategy": "Use monkeypatched env and PlatformConfig-compatible fixtures to assert parsed fields, precedence, URL normalization, invalid max-length handling, and canonical home target state."
+        },
+        {
+          "id": 2,
+          "title": "Add requirement and configuration validation helpers",
+          "description": "Implement check_requirements and validate_config for base Zulip credentials.",
+          "dependencies": [
+            1
+          ],
+          "details": "Make check_requirements require non-empty ZULIP_SITE_URL, ZULIP_BOT_EMAIL, ZULIP_API_KEY, and importable httpx; make validate_config check only base credentials from env or config.extra while allowing missing allowlists.",
+          "status": "pending",
+          "testStrategy": "Test false results with missing credentials or unavailable httpx, true results with valid env, and validate_config behavior when allowlists are absent."
+        },
+        {
+          "id": 3,
+          "title": "Implement env enablement and home channel seeding",
+          "description": "Create _env_enablement that seeds Hermes platform extras from Zulip environment variables.",
+          "dependencies": [
+            1
+          ],
+          "details": "Return None without base credentials; otherwise return extras for site_url, bot_email, api_key, allowlists, max_message_chars, and home_channel using dm_email:<email> or dm_user:<id> when a home target is configured.",
+          "status": "pending",
+          "testStrategy": "Monkeypatch email and user-id home targets separately and assert extras and home_channel names and chat IDs match the expected canonical shape."
+        },
+        {
+          "id": 4,
+          "title": "Register the Zulip platform with Hermes hooks",
+          "description": "Expose register(ctx) so Hermes can discover and construct the Zulip platform plugin.",
+          "dependencies": [
+            1,
+            2,
+            3
+          ],
+          "details": "Call ctx.register_platform with name zulip, label Zulip, adapter_factory, check_fn, validate_config, required_env, env_enablement_fn, cron_deliver_env_var, allowed_users_env, max_message_length, platform_hint, emoji or fallback, and standalone_sender_fn if available.",
+          "status": "pending",
+          "testStrategy": "Use a fake registry context to assert register_platform is called once with the expected name, hooks, required env vars, platform hint, and metadata values."
+        }
+      ]
     },
     {
       "id": 3,
@@ -40,7 +108,65 @@
       "complexityScore": 8,
       "recommendedSubtasks": 5,
       "expansionPrompt": "Break this into async HTTP client setup, queue registration response parsing, connect and disconnect state transitions, long-poll event loop processing, and BAD_EVENT_QUEUE_ID plus network error recovery tests.",
-      "reasoning": "High complexity because it combines async lifecycle management, Zulip Events API semantics, background task cancellation, state tracking for last_event_id, re-registration without backlog replay, and robust behavior on transient network or API errors. The tests require careful fake async clients and task control to avoid flaky behavior."
+      "reasoning": "High complexity because it combines async lifecycle management, Zulip Events API semantics, background task cancellation, state tracking for last_event_id, re-registration without backlog replay, and robust behavior on transient network or API errors. The tests require careful fake async clients and task control to avoid flaky behavior.",
+      "subtasks": [
+        {
+          "id": 1,
+          "title": "Set up direct async Zulip HTTP client",
+          "description": "Create the httpx AsyncClient setup and Zulip API base URL handling.",
+          "dependencies": [],
+          "details": "Build api_base from the normalized site URL, configure HTTP Basic auth with bot email and API key, avoid the official Zulip package and local zuliprc files, and prepare client timeout values appropriate for long polling.",
+          "status": "pending",
+          "testStrategy": "Mock httpx.AsyncClient construction and assert auth, base URL usage, and absence of any zulip package or file-based credential dependency."
+        },
+        {
+          "id": 2,
+          "title": "Implement event queue registration helper",
+          "description": "Register a Zulip message event queue and parse returned queue state.",
+          "dependencies": [
+            1
+          ],
+          "details": "POST to /api/v1/register requesting event_types=[\"message\"] and raw Markdown preference when supported, then store queue_id, last_event_id, long-poll timeout, max_message_length, and bot identity fields from the response.",
+          "status": "pending",
+          "testStrategy": "Mock the register response and verify request payload, stored queue fields, max message length, and bot identity extraction."
+        },
+        {
+          "id": 3,
+          "title": "Implement connect and disconnect lifecycle transitions",
+          "description": "Wire queue registration into adapter connect and add clean disconnect behavior.",
+          "dependencies": [
+            1,
+            2
+          ],
+          "details": "connect should validate credentials, create the client, register the queue, start the polling task, mark connected only after success, and warn when allowlists are empty; disconnect should stop polling, cancel and await the task, close the client, and mark disconnected.",
+          "status": "pending",
+          "testStrategy": "Assert successful connect starts polling and marks connected after registration, failed registration does not mark connected, and disconnect cancels the task and calls aclose."
+        },
+        {
+          "id": 4,
+          "title": "Implement long-poll event loop processing",
+          "description": "Poll Zulip events and dispatch only message events for inbound routing.",
+          "dependencies": [
+            2,
+            3
+          ],
+          "details": "GET /api/v1/events with queue_id and last_event_id, ignore heartbeat and non-message events, advance last_event_id to the highest received event id, and pass valid message events into the inbound processing path.",
+          "status": "pending",
+          "testStrategy": "Use fake async GET responses to verify heartbeat and non-message ignores, last_event_id advancement, and message events being handed to the processing helper."
+        },
+        {
+          "id": 5,
+          "title": "Handle queue expiry and transient polling errors",
+          "description": "Recover from BAD_EVENT_QUEUE_ID and network or API errors without replaying backlog.",
+          "dependencies": [
+            2,
+            4
+          ],
+          "details": "On Zulip BAD_EVENT_QUEUE_ID, log queue expiry, register a fresh queue, and continue from the new queue state; on httpx or API errors, log a safe short error, sleep modestly, and continue without durable retries.",
+          "status": "pending",
+          "testStrategy": "Mock BAD_EVENT_QUEUE_ID and httpx exceptions to assert re-registration occurs, backlog is not fetched, polling continues, and sensitive values are not included in errors."
+        }
+      ]
     },
     {
       "id": 4,
@@ -54,7 +180,78 @@
       "complexityScore": 9,
       "recommendedSubtasks": 6,
       "expansionPrompt": "Split into authorization and self-message filters, unsupported event ignores, DM acceptance and denial behavior, stream mention and slash-command invocation rules, chat ID and metadata construction, and MessageEvent forwarding tests.",
-      "reasoning": "Very high complexity because this is the core security and routing surface. It must fail closed, avoid bot loops, distinguish DMs from stream topics, parse mentions without hardcoded names, preserve stable conversation IDs, and construct MessageEvent objects using repository-specific APIs. The test matrix is broad and covers many edge cases."
+      "reasoning": "Very high complexity because this is the core security and routing surface. It must fail closed, avoid bot loops, distinguish DMs from stream topics, parse mentions without hardcoded names, preserve stable conversation IDs, and construct MessageEvent objects using repository-specific APIs. The test matrix is broad and covers many edge cases.",
+      "subtasks": [
+        {
+          "id": 1,
+          "title": "Implement authorization and self-message filters",
+          "description": "Add inbound security checks for allowlists and bot loop prevention.",
+          "dependencies": [],
+          "details": "Authorize senders by lowercased email or string user ID, fail closed when both allowlists are empty, deny unauthorized DMs with a short response, silently ignore unauthorized streams, and ignore bot self-messages by email or discovered user ID.",
+          "status": "pending",
+          "testStrategy": "Cover missing allowlists, email and user-id matches, unauthorized DM denial, unauthorized stream silence, and self-message ignores by email and user ID."
+        },
+        {
+          "id": 2,
+          "title": "Ignore unsupported Zulip event variants",
+          "description": "Filter out reactions, edits, deletes, and non-message updates before Hermes routing.",
+          "dependencies": [
+            1
+          ],
+          "details": "Inspect Zulip event and message operation fields and return without forwarding for reactions, edit/delete updates, heartbeat-like payloads, and any unsupported non-text v1 message behavior.",
+          "status": "pending",
+          "testStrategy": "Feed representative reaction, edit, delete, and non-message payloads into the processing helper and assert no MessageEvent is recorded."
+        },
+        {
+          "id": 3,
+          "title": "Implement DM acceptance and unauthorized denial behavior",
+          "description": "Forward allowed direct messages and slash commands while rejecting unauthorized DMs.",
+          "dependencies": [
+            1,
+            2
+          ],
+          "details": "Accept Zulip direct/private DM messages from allowed users, including bare slash commands, build the DM chat ID, and call handle_message once; use send() for the unauthorized DM denial path.",
+          "status": "pending",
+          "testStrategy": "Test allowed DM text and DM slash commands produce one event each, while unauthorized DMs call send with the denial and produce no event."
+        },
+        {
+          "id": 4,
+          "title": "Implement stream invocation and mention parsing rules",
+          "description": "Accept stream/topic messages only when Hermes is explicitly invoked or direct reply metadata supports it.",
+          "dependencies": [
+            1,
+            2
+          ],
+          "details": "Use mention flags and common Zulip Markdown mention forms derived from bot identity rather than hardcoded names, strip a leading mention when practical, ignore bare stream slash commands, and optionally accept direct replies to Hermes messages when available without history fetches.",
+          "status": "pending",
+          "testStrategy": "Cover stream no-mention ignores, mentioned prompts accepted with mention stripped, bare stream slash commands ignored, mentioned slash commands accepted, and direct-reply acceptance only if implemented."
+        },
+        {
+          "id": 5,
+          "title": "Build stable chat IDs and Zulip source metadata",
+          "description": "Create canonical conversation identifiers and metadata for Hermes MessageEvent objects.",
+          "dependencies": [
+            3,
+            4
+          ],
+          "details": "Generate dm:<recipient> and stream:<stream-id-or-name>:topic:<encoded-topic> chat IDs using safe reversible topic encoding, derive chat names and types, and include sender, stream, topic, recipient, message ID, and permalink metadata when available.",
+          "status": "pending",
+          "testStrategy": "Assert same stream/topic gives stable IDs, different topics differ, DMs are stable, special topic characters are encoded, and produced events include expected source metadata."
+        },
+        {
+          "id": 6,
+          "title": "Forward accepted Zulip messages as Hermes MessageEvents",
+          "description": "Construct and submit MessageEvent instances using the repository base platform API.",
+          "dependencies": [
+            3,
+            4,
+            5
+          ],
+          "details": "Use the exact MessageEvent, MessageType, build_source, and handle_message APIs from gateway/platforms/base.py so each accepted inbound Zulip message is forwarded exactly once with Markdown content and complete source context.",
+          "status": "pending",
+          "testStrategy": "Use a fake adapter recording handle_message calls and assert accepted DM and stream cases produce exactly one MessageEvent with expected content, chat ID, source, and metadata."
+        }
+      ]
     },
     {
       "id": 5,
@@ -68,7 +265,65 @@
       "complexityScore": 8,
       "recommendedSubtasks": 5,
       "expansionPrompt": "Break into stream and DM payload routing, home DM delivery, message splitting with paragraph and code fence handling, SendResult failure semantics, and optional standalone sender implementation.",
-      "reasoning": "High complexity because send must route correctly from both metadata and canonical chat IDs, support home delivery, split long Markdown safely, send chunks sequentially, and return accurate overall failure results without retries. Standalone sender support adds integration uncertainty depending on Hermes expectations."
+      "reasoning": "High complexity because send must route correctly from both metadata and canonical chat IDs, support home delivery, split long Markdown safely, send chunks sequentially, and return accurate overall failure results without retries. Standalone sender support adds integration uncertainty depending on Hermes expectations.",
+      "subtasks": [
+        {
+          "id": 1,
+          "title": "Route stream and DM sends to Zulip payloads",
+          "description": "Implement send() routing for stream/topic replies and direct messages.",
+          "dependencies": [],
+          "details": "Resolve routing from metadata first and canonical chat_id second, POST stream replies with type stream, to, topic, and content, and POST DMs with type direct, one target email or user ID, and Markdown content.",
+          "status": "pending",
+          "testStrategy": "Mock the HTTP client and assert stream and DM calls hit /api/v1/messages with the correct type, to, topic, and content fields."
+        },
+        {
+          "id": 2,
+          "title": "Support configured home DM delivery",
+          "description": "Route Hermes home delivery to the configured Zulip email or user-id DM target.",
+          "dependencies": [
+            1
+          ],
+          "details": "Use ZULIP_HOME_EMAIL or ZULIP_HOME_USER_ID seeded into home_channel as dm_email:<email> or dm_user:<id>, require home delivery to be DM-only, and fail clearly when no home target is configured.",
+          "status": "pending",
+          "testStrategy": "Test dm_email and dm_user home chat IDs route to direct messages and that missing home configuration returns a clear failure."
+        },
+        {
+          "id": 3,
+          "title": "Implement Markdown-aware long message splitting",
+          "description": "Split long outbound responses before sending them to Zulip.",
+          "dependencies": [
+            1
+          ],
+          "details": "Choose the limit from ZULIP_MAX_MESSAGE_CHARS, registered max_message_length, or 8000, split on blank-line and paragraph boundaries first, avoid splitting inside fenced code blocks when practical, and hard split oversized blocks without adding part prefixes.",
+          "status": "pending",
+          "testStrategy": "Verify long content splits below the limit, paragraph boundaries are preferred, oversized paragraphs are hard split, code fences are preserved where possible, and no part prefixes are added."
+        },
+        {
+          "id": 4,
+          "title": "Return accurate SendResult values on success and failure",
+          "description": "Handle Zulip send success, API errors, and httpx exceptions without retry queues.",
+          "dependencies": [
+            1,
+            3
+          ],
+          "details": "Send chunks sequentially, return success only if every chunk succeeds, include the last Zulip message ID when available, log safe short failures, return SendResult(success=False, error=...) on any exception or result != success, and do not enqueue retries.",
+          "status": "pending",
+          "testStrategy": "Mock successful multi-chunk sends, Zulip error responses, and httpx exceptions to assert overall SendResult semantics and no additional retry attempts."
+        },
+        {
+          "id": 5,
+          "title": "Add optional standalone sender for cron delivery",
+          "description": "Implement standalone sender support if the Hermes plugin API shape is straightforward.",
+          "dependencies": [
+            1,
+            2,
+            4
+          ],
+          "details": "Create _standalone_send using a temporary adapter or shared stateless HTTP helper, send only to the configured Zulip home DM or supplied canonical DM chat ID, close the ephemeral client, and return the response shape expected by Hermes standalone sender hooks.",
+          "status": "pending",
+          "testStrategy": "If implemented, monkeypatch env/config and assert standalone sending performs one ephemeral direct send, closes its client, and reports failures consistently with send()."
+        }
+      ]
     },
     {
       "id": 6,
@@ -82,7 +337,76 @@
       "complexityScore": 8,
       "recommendedSubtasks": 6,
       "expansionPrompt": "Organize the suite into fixtures and fake HTTP clients, config and registration tests, lifecycle and polling tests, inbound routing tests, chat mapping tests, outbound sending tests, and metadata documentation safety checks where applicable.",
-      "reasoning": "High complexity due to the size of the required behavior matrix and the need for reliable async mocks. The tests must cover security-sensitive fail-closed behavior, event queue renewal, routing rules, message splitting, plugin registration, and metadata without real credentials or network access."
+      "reasoning": "High complexity due to the size of the required behavior matrix and the need for reliable async mocks. The tests must cover security-sensitive fail-closed behavior, event queue renewal, routing rules, message splitting, plugin registration, and metadata without real credentials or network access.",
+      "subtasks": [
+        {
+          "id": 1,
+          "title": "Create pytest fixtures and fake Zulip clients",
+          "description": "Build reusable mocked config, adapter, response, and async HTTP client test fixtures.",
+          "dependencies": [],
+          "details": "Create tests/plugins/platforms/test_zulip_adapter.py with PlatformConfig-compatible fixtures, fake httpx responses, fake AsyncClient methods, and adapter helpers that record connection marks, handle_message calls, send calls, and closed clients.",
+          "status": "pending",
+          "testStrategy": "Run fixture smoke tests or simple tests proving fake clients support awaited post, get, and aclose calls without network access."
+        },
+        {
+          "id": 2,
+          "title": "Cover configuration metadata and registration behavior",
+          "description": "Test env parsing, requirement checks, env enablement, plugin metadata, and register(ctx).",
+          "dependencies": [
+            1
+          ],
+          "details": "Add tests for check_requirements, validate_config, _env_enablement extras and home_channel, fail-closed missing allowlist state, plugin.yaml env vars, platform_hint, and fake ctx.register_platform hook arguments.",
+          "status": "pending",
+          "testStrategy": "Run focused pytest cases with monkeypatched env and no real Zulip variables outside each test."
+        },
+        {
+          "id": 3,
+          "title": "Cover async lifecycle and event polling behavior",
+          "description": "Test queue registration, poll task lifecycle, event ignores, and queue renewal.",
+          "dependencies": [
+            1
+          ],
+          "details": "Mock AsyncClient to validate connect register payloads, connected marking, disconnect cancellation and close behavior, heartbeat and non-message ignores, last_event_id advancement, and BAD_EVENT_QUEUE_ID re-registration without backlog replay.",
+          "status": "pending",
+          "testStrategy": "Use pytest async tests with controlled fake responses and short-running poll helpers to avoid flaky background tasks."
+        },
+        {
+          "id": 4,
+          "title": "Cover inbound routing security and invocation rules",
+          "description": "Test allowed and rejected inbound DM and stream cases across the PRD matrix.",
+          "dependencies": [
+            1
+          ],
+          "details": "Assert fail-closed allowlist behavior, case-insensitive email and user-id authorization, unauthorized DM denial, unauthorized stream silence, self-message ignore, reaction/edit/delete ignore, allowed DM routing, mentioned stream routing, slash-command rules, and direct-reply behavior if implemented.",
+          "status": "pending",
+          "testStrategy": "Feed representative Zulip event dictionaries into the inbound processing helper and assert recorded handle_message or send calls exactly match expectations."
+        },
+        {
+          "id": 5,
+          "title": "Cover chat mapping and outbound sending behavior",
+          "description": "Test canonical chat IDs, metadata, send payloads, splitting, and failures.",
+          "dependencies": [
+            1
+          ],
+          "details": "Assert stable DM and stream/topic chat IDs, safe topic encoding, metadata fields, stream and DM outbound payloads, home DM routing, long-message split behavior, API failure SendResult, and absence of retry queue behavior.",
+          "status": "pending",
+          "testStrategy": "Use mocked clients to inspect posted payload order and SendResult values for success, chunked success, Zulip errors, and httpx exceptions."
+        },
+        {
+          "id": 6,
+          "title": "Run focused plugin test suite and registry checks",
+          "description": "Execute the new mocked tests and any nearby Hermes plugin discovery tests.",
+          "dependencies": [
+            2,
+            3,
+            4,
+            5
+          ],
+          "details": "Run pytest for tests/plugins/platforms/test_zulip_adapter.py and, if the checkout has relevant registry or plugin discovery tests, run those too while ensuring no real Zulip credentials, ~/.hermes, or ~/.zuliprc are required.",
+          "status": "pending",
+          "testStrategy": "Record the exact pytest commands and confirm they pass with only per-test monkeypatched environment variables."
+        }
+      ]
     },
     {
       "id": 7,
@@ -96,7 +420,29 @@
       "complexityScore": 3,
       "recommendedSubtasks": 2,
       "expansionPrompt": "Break this into documenting setup and environment variables, then documenting behavior, test commands, and explicit v1 non-goals.",
-      "reasoning": "Low to moderate complexity because this is documentation rather than runtime implementation. The main work is accuracy: matching plugin.yaml and adapter behavior, making fail-closed allowlist behavior clear, and avoiding unsupported features or real secrets. Verification is mostly review and simple grep or docs linting if available."
+      "reasoning": "Low to moderate complexity because this is documentation rather than runtime implementation. The main work is accuracy: matching plugin.yaml and adapter behavior, making fail-closed allowlist behavior clear, and avoiding unsupported features or real secrets. Verification is mostly review and simple grep or docs linting if available.",
+      "subtasks": [
+        {
+          "id": 1,
+          "title": "Document setup and environment configuration",
+          "description": "Add README setup instructions and list all supported Zulip environment variables.",
+          "dependencies": [],
+          "details": "Create plugins/platforms/zulip/README.md documenting checkout and runtime-local plugin installation paths, required Zulip credentials, the requirement for either allowed emails or allowed user IDs, fail-closed behavior when both allowlists are missing, and optional home and max-length variables.",
+          "status": "pending",
+          "testStrategy": "Review README.md against plugin.yaml and adapter.py to ensure all env var names match and no config-file credential or unsupported setting is documented."
+        },
+        {
+          "id": 2,
+          "title": "Document behavior tests and explicit v1 limitations",
+          "description": "Describe runtime behavior, focused test commands, and features excluded from v1.",
+          "dependencies": [
+            1
+          ],
+          "details": "Document Zulip bot-only Events API polling, allowed DM behavior, stream mention or direct-reply invocation, stream-topic conversation boundaries, Markdown-only sends, long-message splitting, no backlog replay, DM-only home delivery, mocked pytest command, and all PRD non-goals such as webhooks, user-account mode, attachments, typing, queues, edit/delete sync, reactions, and live integration tests.",
+          "status": "pending",
+          "testStrategy": "Run a grep or docs check to ensure no real-looking secrets, personal domains, hardcoded user IDs, or unsupported configuration names appear in the README."
+        }
+      ]
     }
   ]
 }
