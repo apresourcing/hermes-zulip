@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import importlib.util
+import logging
 import os
 from types import SimpleNamespace
 from typing import Any
@@ -20,13 +23,21 @@ try:
 except ImportError:  # pragma: no cover - depends on Hermes checkout version
     build_source = None
 
+try:
+    import httpx
+except ImportError:  # pragma: no cover - check_requirements reports this cleanly
+    httpx = None
+
 
 DEFAULT_MAX_MESSAGE_CHARS = 8000
+DEFAULT_LONGPOLL_TIMEOUT_SECONDS = 90
+POLL_ERROR_SLEEP_SECONDS = 5
 REQUIRED_ENV = ["ZULIP_SITE_URL", "ZULIP_BOT_EMAIL", "ZULIP_API_KEY"]
 PLATFORM_HINT = (
     "You are chatting via Zulip. Zulip supports Markdown. In streams, keep "
     "replies relevant to the current topic."
 )
+logger = logging.getLogger(__name__)
 
 
 def _extra(config: Any) -> dict[str, Any]:
@@ -124,23 +135,75 @@ def _home_channel(home_email: str | None, home_user_id: str | None) -> dict[str,
 
 
 class ZulipAdapter(BasePlatformAdapter):
-    """Configuration holder for Zulip platform integration."""
+    """Zulip platform integration using the Zulip Events API."""
 
     def __init__(self, config: PlatformConfig):
         super().__init__(config)
         self.config = config
         self.site_url, self.bot_email, self.api_key = _read_required(config)
+        self.api_base = f"{self.site_url}/api/v1" if self.site_url else ""
         self.allowed_emails = _read_allowed_emails(config)
         self.allowed_user_ids = _read_allowed_user_ids(config)
         self.home_email, self.home_user_id = _read_home_target(config)
         self.home_channel = _home_channel(self.home_email, self.home_user_id)
         self.max_message_chars = _read_max_message_chars(config)
+        self.max_message_length: int | None = None
+        self.queue_id: str | None = None
+        self.last_event_id: int | None = None
+        self.event_queue_longpoll_timeout_seconds = DEFAULT_LONGPOLL_TIMEOUT_SECONDS
+        self.bot_user_id: str | None = None
+        self.bot_full_name: str | None = None
+        self.bot_avatar_url: str | None = None
+        self._client: Any | None = None
+        self._poll_task: asyncio.Task | None = None
+        self._stop_polling: asyncio.Event | None = None
 
-    async def connect(self) -> None:
-        raise NotImplementedError("Zulip connect is implemented by the sending/polling task")
+    async def connect(self) -> bool:
+        """Create the Zulip HTTP client, register an event queue, and start polling."""
+        if not all((self.site_url, self.bot_email, self.api_key)):
+            logger.error("Zulip connection requires site URL, bot email, and API key")
+            return False
+        if httpx is None:
+            logger.error("Zulip connection requires httpx")
+            return False
+
+        if not self.allowed_emails and not self.allowed_user_ids:
+            logger.warning("Zulip inbound messages will be rejected: no allowlist configured")
+
+        self._client = httpx.AsyncClient(auth=(self.bot_email, self.api_key))
+        self._stop_polling = asyncio.Event()
+
+        try:
+            await self._register_event_queue()
+        except Exception as exc:
+            logger.error("Failed to register Zulip event queue: %s", exc)
+            await self._close_client()
+            self._stop_polling = None
+            return False
+
+        self._poll_task = asyncio.create_task(self._poll_loop(), name="zulip-event-poll")
+        self._mark_adapter_connected()
+        logger.info("Connected Zulip adapter to %s", self.site_url)
+        return True
 
     async def disconnect(self) -> None:
-        raise NotImplementedError("Zulip disconnect is implemented by the sending/polling task")
+        """Stop polling and close the Zulip HTTP client."""
+        if self._stop_polling is not None:
+            self._stop_polling.set()
+
+        poll_task = self._poll_task
+        self._poll_task = None
+        if poll_task is not None:
+            poll_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await poll_task
+
+        await self._close_client()
+        self.queue_id = None
+        self.last_event_id = None
+        self._stop_polling = None
+        self._mark_adapter_disconnected()
+        logger.info("Disconnected Zulip adapter")
 
     async def send(
         self,
@@ -150,6 +213,165 @@ class ZulipAdapter(BasePlatformAdapter):
         metadata: dict[str, Any] | None = None,
     ) -> SendResult:
         raise NotImplementedError("Zulip send is implemented by the sending task")
+
+    async def _register_event_queue(self) -> dict[str, Any]:
+        """Register a Zulip queue scoped to message events and store queue state."""
+        if self._client is None:
+            raise RuntimeError("Zulip HTTP client is not initialized")
+
+        response = await self._client.post(
+            f"{self.api_base}/register",
+            data={"event_types": ["message"], "apply_markdown": "false"},
+        )
+        self._raise_for_status(response)
+        payload = response.json()
+        if payload.get("result") == "error":
+            raise RuntimeError(payload.get("msg") or payload.get("code") or "Zulip register failed")
+        if payload.get("result") not in (None, "success"):
+            raise RuntimeError("Zulip register returned an unexpected result")
+
+        queue_id = payload.get("queue_id")
+        if not queue_id:
+            raise RuntimeError("Zulip register response did not include queue_id")
+
+        self.queue_id = str(queue_id)
+        self.last_event_id = self._coerce_event_id(payload.get("last_event_id"))
+
+        longpoll_timeout = _parse_positive_int(
+            payload.get("event_queue_longpoll_timeout_seconds")
+        )
+        if longpoll_timeout is not None:
+            self.event_queue_longpoll_timeout_seconds = longpoll_timeout
+
+        max_message_length = _parse_positive_int(payload.get("max_message_length"))
+        if max_message_length is not None:
+            self.max_message_length = max_message_length
+            self.max_message_chars = max_message_length
+
+        self._store_bot_identity(payload)
+        logger.info("Registered Zulip event queue")
+        return payload
+
+    async def _poll_loop(self) -> None:
+        """Long-poll Zulip events until disconnected."""
+        while not self._should_stop_polling():
+            try:
+                await self._poll_once()
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.error("Zulip event polling failed: %s", exc)
+                await self._sleep_after_poll_error()
+
+    async def _poll_once(self) -> None:
+        if self._client is None:
+            raise RuntimeError("Zulip HTTP client is not initialized")
+        if not self.queue_id:
+            await self._register_event_queue()
+            return
+
+        response = await self._client.get(
+            f"{self.api_base}/events",
+            params={
+                "queue_id": self.queue_id,
+                "last_event_id": self.last_event_id,
+            },
+            timeout=self.event_queue_longpoll_timeout_seconds + 10,
+        )
+        self._raise_for_status(response)
+        payload = response.json()
+
+        if payload.get("result") == "error":
+            if payload.get("code") == "BAD_EVENT_QUEUE_ID":
+                logger.warning("Zulip event queue expired; registering a fresh queue")
+                await self._register_event_queue()
+                return
+            raise RuntimeError(payload.get("msg") or payload.get("code") or "Zulip events failed")
+
+        events = payload.get("events") or []
+        highest_event_id = self.last_event_id
+        for event in events:
+            event_id = self._coerce_event_id(event.get("id"))
+            if event_id is not None and (
+                highest_event_id is None or event_id > highest_event_id
+            ):
+                highest_event_id = event_id
+
+            if event.get("type") != "message":
+                continue
+            await self._handle_zulip_message_event(event)
+
+        self.last_event_id = highest_event_id
+
+    async def _handle_zulip_message_event(self, event: dict[str, Any]) -> None:
+        """Hook for inbound routing; later adapter layers convert events to MessageEvent."""
+
+    async def _sleep_after_poll_error(self) -> None:
+        if self._stop_polling is None:
+            await asyncio.sleep(POLL_ERROR_SLEEP_SECONDS)
+            return
+
+        try:
+            await asyncio.wait_for(
+                self._stop_polling.wait(),
+                timeout=POLL_ERROR_SLEEP_SECONDS,
+            )
+        except asyncio.TimeoutError:
+            return
+
+    async def _close_client(self) -> None:
+        client = self._client
+        self._client = None
+        if client is not None:
+            await client.aclose()
+
+    def _should_stop_polling(self) -> bool:
+        return self._stop_polling is not None and self._stop_polling.is_set()
+
+    def _mark_adapter_connected(self) -> None:
+        marker = getattr(self, "_mark_connected", None)
+        if callable(marker):
+            marker()
+
+    def _mark_adapter_disconnected(self) -> None:
+        marker = getattr(self, "_mark_disconnected", None)
+        if callable(marker):
+            marker()
+
+    @staticmethod
+    def _raise_for_status(response: Any) -> None:
+        raise_for_status = getattr(response, "raise_for_status", None)
+        if callable(raise_for_status):
+            raise_for_status()
+
+    @staticmethod
+    def _coerce_event_id(value: Any) -> int | None:
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return None
+
+    def _store_bot_identity(self, payload: dict[str, Any]) -> None:
+        user_id = (
+            payload.get("user_id")
+            or payload.get("bot_user_id")
+            or payload.get("realm_bot", {}).get("user_id")
+        )
+        if user_id is not None:
+            self.bot_user_id = str(user_id)
+
+        self.bot_full_name = (
+            payload.get("full_name")
+            or payload.get("bot_full_name")
+            or payload.get("realm_bot", {}).get("full_name")
+            or self.bot_full_name
+        )
+        self.bot_avatar_url = (
+            payload.get("avatar_url")
+            or payload.get("bot_avatar_url")
+            or payload.get("realm_bot", {}).get("avatar_url")
+            or self.bot_avatar_url
+        )
 
 
 def _base_credentials_present(config: Any | None = None) -> bool:
