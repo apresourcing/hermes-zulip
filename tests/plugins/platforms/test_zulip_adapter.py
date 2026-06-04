@@ -657,6 +657,53 @@ async def test_unauthorized_stream_is_ignored_without_denial(adapter_module):
 
 
 @pytest.mark.asyncio
+async def test_missing_allowlist_fails_closed_and_logs_no_message_body_or_api_key(
+    adapter_module,
+    caplog,
+):
+    adapter = _make_recording_adapter(adapter_module, extra={"allowed_emails": []})
+    adapter.allowed_emails = set()
+    adapter.allowed_user_ids = set()
+    sent = []
+
+    async def send(chat_id, content, reply_to=None, metadata=None):
+        sent.append((chat_id, content, metadata))
+        return types.SimpleNamespace(success=True)
+
+    adapter.send = send
+
+    with caplog.at_level("INFO", logger=adapter_module.__name__):
+        await adapter._handle_zulip_message_event(
+            _message_event(
+                _base_message(
+                    content="private request body",
+                    sender_email="alice@example.com",
+                    sender_id=123,
+                )
+            )
+        )
+        await adapter._handle_zulip_message_event(
+            _message_event(
+                _stream_message(
+                    content="sensitive stream body",
+                    sender_email="alice@example.com",
+                    sender_id=123,
+                    flags=["mentioned"],
+                )
+            )
+        )
+
+    assert adapter.events == []
+    assert len(sent) == 1
+    assert sent[0][0] == "dm:555"
+    assert sent[0][1] == adapter_module.UNAUTHORIZED_DM_MESSAGE
+    assert sent[0][2]["zulip_sender_email"] == "alice@example.com"
+    assert "private request body" not in caplog.text
+    assert "sensitive stream body" not in caplog.text
+    assert "secret" not in caplog.text
+
+
+@pytest.mark.asyncio
 async def test_dm_message_and_slash_command_are_accepted(adapter_module):
     adapter = _make_recording_adapter(adapter_module)
 
@@ -745,6 +792,26 @@ def test_stream_chat_ids_are_stable_per_stream_topic_and_safely_encoded(adapter_
     assert same_a != different
     assert same_a == "stream:42:topic:release%20plan"
     assert different == "stream:42:topic:release%2Fplan%3A%CE%94"
+
+
+def test_dm_chat_ids_are_stable_and_distinct_from_streams(adapter_module):
+    adapter = _make_recording_adapter(adapter_module)
+
+    same_a = adapter._dm_chat_id(_base_message(recipient_id=555))
+    same_b = adapter._dm_chat_id(_base_message(recipient_id=555))
+    sorted_group_dm = adapter._dm_chat_id(
+        _base_message(
+            recipient_id=None,
+            display_recipient=[
+                {"id": 99, "email": "bot@example.com", "full_name": "Hermes Bot"},
+                {"id": 123, "email": "alice@example.com", "full_name": "Alice"},
+            ],
+        )
+    )
+
+    assert same_a == same_b == "dm:555"
+    assert sorted_group_dm == "dm:123,99"
+    assert not same_a.startswith("stream:")
 
 
 @pytest.mark.asyncio
@@ -929,6 +996,23 @@ async def test_send_http_exception_returns_failure(adapter_module):
 
 
 @pytest.mark.asyncio
+async def test_send_status_error_returns_failure_without_retry(adapter_module):
+    adapter = _make_adapter(adapter_module)
+    adapter._client = FakeAsyncClient(
+        post_responses=[
+            FakeResponse({"result": "success"}, status_error=RuntimeError("403 forbidden")),
+            FakeResponse({"result": "success", "id": 2}),
+        ]
+    )
+
+    result = await adapter.send("dm_user:123", "hello")
+
+    assert result.success is False
+    assert result.error == "403 forbidden"
+    assert len(adapter._client.post_calls) == 1
+
+
+@pytest.mark.asyncio
 async def test_standalone_sender_uses_home_dm_and_closes_client(adapter_module, monkeypatch):
     _patch_httpx_client(
         adapter_module,
@@ -961,3 +1045,29 @@ async def test_standalone_sender_uses_home_dm_and_closes_client(adapter_module, 
             },
         )
     ]
+
+
+@pytest.mark.asyncio
+async def test_standalone_sender_fails_clearly_without_home_target(
+    adapter_module,
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        adapter_module,
+        "httpx",
+        types.SimpleNamespace(AsyncClient=lambda **kwargs: None),
+    )
+    config = FakePlatformConfig(
+        extra={
+            "site_url": "https://example.zulipchat.com/",
+            "bot_email": "bot@example.com",
+            "api_key": "secret",
+        }
+    )
+
+    result = await adapter_module._standalone_send(config, None, "cron message")
+
+    assert result == {
+        "success": False,
+        "error": "Zulip home DM is not configured",
+    }
