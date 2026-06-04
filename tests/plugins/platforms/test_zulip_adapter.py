@@ -526,3 +526,232 @@ async def test_disconnect_cancels_poll_task_closes_client_and_marks_disconnected
     assert adapter._client is None
     assert FakeAsyncClient.instances[-1].closed is True
     assert marks == ["disconnected"]
+
+
+def _base_message(**overrides):
+    message = {
+        "id": 1001,
+        "type": "private",
+        "content": "hello Hermes",
+        "sender_email": "alice@example.com",
+        "sender_full_name": "Alice Example",
+        "sender_id": 123,
+        "display_recipient": [
+            {"id": 123, "email": "alice@example.com", "full_name": "Alice Example"},
+            {"id": 99, "email": "bot@example.com", "full_name": "Hermes Bot"},
+        ],
+        "recipient_id": 555,
+        "flags": [],
+        "permalink": "https://example.zulipchat.com/#narrow/dm/555",
+    }
+    message.update(overrides)
+    return message
+
+
+def _stream_message(**overrides):
+    message = _base_message(
+        type="stream",
+        content="hello from stream",
+        display_recipient="engineering",
+        stream_id=42,
+        topic="release plan",
+        recipient_id=777,
+        permalink="https://example.zulipchat.com/#narrow/stream/42-engineering/topic/release.20plan",
+    )
+    message.update(overrides)
+    return message
+
+
+def _message_event(message):
+    return {"id": 9001, "type": "message", "op": "add", "message": message}
+
+
+def _event_source(event):
+    return event.source if hasattr(event, "source") else event["source"]
+
+
+def _make_recording_adapter(adapter_module, *, extra=None):
+    config_extra = {
+        "site_url": "https://example.zulipchat.com/",
+        "bot_email": "bot@example.com",
+        "api_key": "secret",
+        "allowed_emails": ["alice@example.com"],
+    }
+    if extra:
+        config_extra.update(extra)
+    adapter = adapter_module.ZulipAdapter(FakePlatformConfig(extra=config_extra))
+    adapter.bot_user_id = "99"
+    adapter.bot_full_name = "Hermes Bot"
+    adapter.events = []
+
+    async def handle_message(event):
+        adapter.events.append(event)
+
+    adapter.handle_message = handle_message
+    return adapter
+
+
+def test_is_authorized_fails_closed_without_allowlists(adapter_module):
+    adapter = _make_recording_adapter(adapter_module, extra={"allowed_emails": []})
+    adapter.allowed_emails = set()
+    adapter.allowed_user_ids = set()
+
+    assert adapter._is_authorized(_base_message()) is False
+
+
+def test_is_authorized_matches_email_case_insensitively(adapter_module):
+    adapter = _make_recording_adapter(adapter_module, extra={"allowed_emails": ["Alice@Example.com"]})
+
+    assert adapter._is_authorized(_base_message(sender_email="ALICE@EXAMPLE.COM")) is True
+
+
+def test_is_authorized_matches_user_id_allowlist(adapter_module):
+    adapter = _make_recording_adapter(
+        adapter_module,
+        extra={"allowed_emails": [], "allowed_user_ids": ["123"]},
+    )
+
+    assert adapter._is_authorized(_base_message(sender_email="mallory@example.com")) is True
+
+
+def test_is_self_message_matches_bot_email_and_user_id(adapter_module):
+    adapter = _make_recording_adapter(adapter_module)
+
+    assert adapter._is_self_message(_base_message(sender_email="BOT@example.com")) is True
+    assert adapter._is_self_message(_base_message(sender_id=99, sender_email="other@example.com")) is True
+    assert adapter._is_self_message(_base_message(sender_id=123)) is False
+
+
+@pytest.mark.asyncio
+async def test_unauthorized_dm_sends_denial(adapter_module):
+    adapter = _make_recording_adapter(adapter_module)
+    sent = []
+
+    async def send(chat_id, content, reply_to=None, metadata=None):
+        sent.append((chat_id, content, metadata))
+        return types.SimpleNamespace(success=True)
+
+    adapter.send = send
+    await adapter._handle_zulip_message_event(
+        _message_event(_base_message(sender_email="mallory@example.com", sender_id=666))
+    )
+
+    assert adapter.events == []
+    assert sent[0][0] == "dm:555"
+    assert sent[0][1] == adapter_module.UNAUTHORIZED_DM_MESSAGE
+
+
+@pytest.mark.asyncio
+async def test_unauthorized_stream_is_ignored_without_denial(adapter_module):
+    adapter = _make_recording_adapter(adapter_module)
+    sent = []
+    adapter.send = lambda *args, **kwargs: sent.append((args, kwargs))
+
+    await adapter._handle_zulip_message_event(
+        _message_event(_stream_message(sender_email="mallory@example.com", sender_id=666, flags=["mentioned"]))
+    )
+
+    assert adapter.events == []
+    assert sent == []
+
+
+@pytest.mark.asyncio
+async def test_dm_message_and_slash_command_are_accepted(adapter_module):
+    adapter = _make_recording_adapter(adapter_module)
+
+    await adapter._handle_zulip_message_event(_message_event(_base_message(content="hello")))
+    await adapter._handle_zulip_message_event(_message_event(_base_message(id=1002, content="/status")))
+
+    assert [event.content for event in adapter.events] == ["hello", "/status"]
+    assert [_event_source(event)["chat_id"] for event in adapter.events] == ["dm:555", "dm:555"]
+
+
+@pytest.mark.asyncio
+async def test_stream_without_mention_and_bare_slash_command_are_ignored(adapter_module):
+    adapter = _make_recording_adapter(adapter_module)
+
+    await adapter._handle_zulip_message_event(_message_event(_stream_message(content="hello")))
+    await adapter._handle_zulip_message_event(_message_event(_stream_message(id=1002, content="/status")))
+
+    assert adapter.events == []
+
+
+@pytest.mark.asyncio
+async def test_stream_with_mention_is_accepted_and_leading_mention_stripped(adapter_module):
+    adapter = _make_recording_adapter(adapter_module)
+
+    await adapter._handle_zulip_message_event(
+        _message_event(_stream_message(content="@**Hermes Bot** please summarize", flags=["mentioned"]))
+    )
+
+    assert len(adapter.events) == 1
+    event = adapter.events[0]
+    source = _event_source(event)
+    assert event.content == "please summarize"
+    assert source["platform"] == "zulip"
+    assert source["chat_id"] == "stream:42:topic:release%20plan"
+    assert source["chat_name"] == "engineering / release plan"
+    assert source["chat_type"] == "group"
+    assert source["user_id"] == "123"
+    assert source["user_name"] == "Alice Example"
+    assert source["metadata"]["zulip_message_id"] == 1001
+    assert source["metadata"]["zulip_sender_email"] == "alice@example.com"
+    assert source["metadata"]["zulip_sender_id"] == 123
+    assert source["metadata"]["zulip_stream_id"] == 42
+    assert source["metadata"]["zulip_stream_name"] == "engineering"
+    assert source["metadata"]["zulip_topic"] == "release plan"
+    assert source["metadata"]["zulip_recipient_id"] == 777
+    assert source["metadata"]["zulip_permalink"]
+
+
+@pytest.mark.asyncio
+async def test_stream_slash_command_requires_mention(adapter_module):
+    adapter = _make_recording_adapter(adapter_module)
+
+    await adapter._handle_zulip_message_event(
+        _message_event(_stream_message(content="@**Hermes Bot** /status", flags=["mentioned"]))
+    )
+
+    assert [event.content for event in adapter.events] == ["/status"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "event",
+    [
+        {"id": 1, "type": "message", "op": "update", "message": _base_message(content="edited")},
+        {"id": 2, "type": "message", "op": "delete", "message": _base_message(content="deleted")},
+        {"id": 3, "type": "reaction", "message": _base_message(content="reacted")},
+        {"id": 4, "type": "message", "message": {"op": "reaction", **_base_message(content="reacted")}},
+    ],
+)
+async def test_reaction_edit_delete_events_are_ignored(adapter_module, event):
+    adapter = _make_recording_adapter(adapter_module)
+
+    await adapter._handle_zulip_message_event(event)
+
+    assert adapter.events == []
+
+
+def test_stream_chat_ids_are_stable_per_stream_topic_and_safely_encoded(adapter_module):
+    adapter = _make_recording_adapter(adapter_module)
+
+    same_a = adapter._stream_chat_id(_stream_message(topic="release plan"))
+    same_b = adapter._stream_chat_id(_stream_message(topic="release plan"))
+    different = adapter._stream_chat_id(_stream_message(topic="release/plan:Δ"))
+
+    assert same_a == same_b
+    assert same_a != different
+    assert same_a == "stream:42:topic:release%20plan"
+    assert different == "stream:42:topic:release%2Fplan%3A%CE%94"
+
+
+@pytest.mark.asyncio
+async def test_direct_reply_metadata_accepts_stream_message_without_mention(adapter_module):
+    adapter = _make_recording_adapter(adapter_module)
+
+    await adapter._handle_zulip_message_event(
+        _message_event(_stream_message(content="following up", reply_to_sender_id=99))
+    )
+
+    assert [event.content for event in adapter.events] == ["following up"]
