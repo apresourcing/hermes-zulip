@@ -10,7 +10,7 @@ import os
 import re
 from types import SimpleNamespace
 from typing import Any
-from urllib.parse import quote
+from urllib.parse import quote, unquote
 
 from gateway.config import Platform, PlatformConfig
 from gateway.platforms.base import (
@@ -120,14 +120,19 @@ def _parse_positive_int(value: Any) -> int | None:
 
 
 def _read_max_message_chars(config: Any) -> int:
+    configured = _read_configured_max_message_chars(config)
+    return configured if configured is not None else DEFAULT_MAX_MESSAGE_CHARS
+
+
+def _read_configured_max_message_chars(config: Any) -> int | None:
     env_value = os.environ.get("ZULIP_MAX_MESSAGE_CHARS")
     if env_value is not None:
         parsed = _parse_positive_int(env_value)
         if parsed is not None:
             return parsed
-
     parsed = _parse_positive_int(_extra(config).get("max_message_chars"))
-    return parsed if parsed is not None else DEFAULT_MAX_MESSAGE_CHARS
+    return parsed
+
 
 
 def _read_home_target(config: Any) -> tuple[str | None, str | None]:
@@ -169,6 +174,72 @@ def _send_result(success: bool, error: str | None = None, **extra: Any) -> SendR
     return SimpleNamespace(**payload)
 
 
+def _short_error(exc: Exception) -> str:
+    message = _clean_text(exc)
+    return message[:200] if message else exc.__class__.__name__
+
+
+def _coerce_zulip_target(value: Any) -> Any:
+    value = _clean_text(value)
+    return int(value) if value.isdigit() else value
+
+
+def _split_message(content: str, limit: int) -> list[str]:
+    """Split outbound Markdown into Zulip-sized chunks without part prefixes."""
+    limit = max(int(limit), 1)
+    if len(content) <= limit:
+        return [content]
+
+    chunks: list[str] = []
+    current = ""
+    for unit in _markdown_split_units(content):
+        if len(unit) > limit:
+            if current:
+                chunks.append(current)
+                current = ""
+            chunks.extend(_hard_split(unit, limit))
+            continue
+
+        if current and len(current) + len(unit) > limit:
+            chunks.append(current)
+            current = unit
+        else:
+            current += unit
+
+    if current:
+        chunks.append(current)
+    return [chunk for chunk in chunks if chunk]
+
+
+def _markdown_split_units(content: str) -> list[str]:
+    """Return paragraph-ish units, keeping fenced code spans together when possible."""
+    if not content:
+        return [content]
+
+    lines = content.splitlines(keepends=True)
+    units: list[str] = []
+    current: list[str] = []
+    in_fence = False
+
+    for line in lines:
+        current.append(line)
+        stripped = line.lstrip()
+        if stripped.startswith("```"):
+            in_fence = not in_fence
+            continue
+        if not in_fence and not stripped.strip():
+            units.append("".join(current))
+            current = []
+
+    if current:
+        units.append("".join(current))
+    return units
+
+
+def _hard_split(content: str, limit: int) -> list[str]:
+    return [content[index : index + limit] for index in range(0, len(content), limit)]
+
+
 def _normalize_name(value: Any) -> str:
     return re.sub(r"\s+", " ", _clean_text(value).lower())
 
@@ -207,7 +278,13 @@ class ZulipAdapter(BasePlatformAdapter):
         self.allowed_emails = _read_allowed_emails(config)
         self.allowed_user_ids = _read_allowed_user_ids(config)
         self.home_email, self.home_user_id = _read_home_target(config)
-        self.home_channel = _home_channel(self.home_email, self.home_user_id)
+        configured_home_channel = _extra(config).get("home_channel")
+        self.home_channel = _home_channel(self.home_email, self.home_user_id) or (
+            configured_home_channel if isinstance(configured_home_channel, dict) else None
+        )
+        self._max_message_chars_configured = (
+            _read_configured_max_message_chars(config) is not None
+        )
         self.max_message_chars = _read_max_message_chars(config)
         self.max_message_length: int | None = None
         self.queue_id: str | None = None
@@ -280,19 +357,24 @@ class ZulipAdapter(BasePlatformAdapter):
 
         metadata = metadata or {}
         chunks = self._split_outbound_content(content)
+        last_message_id: Any = None
         try:
             for chunk in chunks:
                 payload = self._build_send_payload(chat_id, chunk, metadata)
                 response = await self._client.post(f"{self.api_base}/messages", data=payload)
                 self._raise_for_status(response)
                 body = response.json()
-                if body.get("result") == "error":
-                    return _send_result(False, body.get("msg") or body.get("code") or "Zulip send failed")
+                if body.get("result") != "success":
+                    reason = body.get("msg") or body.get("code") or "Zulip send failed"
+                    logger.error("Zulip send failed: %s", reason)
+                    return _send_result(False, reason)
+                last_message_id = body.get("id", last_message_id)
         except Exception as exc:
-            logger.error("Zulip send failed: %s", exc)
-            return _send_result(False, str(exc))
+            reason = _short_error(exc)
+            logger.error("Zulip send failed: %s", reason)
+            return _send_result(False, reason)
 
-        return _send_result(True)
+        return _send_result(True, message_id=last_message_id)
 
     async def _register_event_queue(self) -> dict[str, Any]:
         """Register a Zulip queue scoped to message events and store queue state."""
@@ -326,7 +408,8 @@ class ZulipAdapter(BasePlatformAdapter):
         max_message_length = _parse_positive_int(payload.get("max_message_length"))
         if max_message_length is not None:
             self.max_message_length = max_message_length
-            self.max_message_chars = max_message_length
+            if not self._max_message_chars_configured:
+                self.max_message_chars = max_message_length
 
         self._store_bot_identity(payload)
         logger.info("Registered Zulip event queue")
@@ -748,28 +831,10 @@ class ZulipAdapter(BasePlatformAdapter):
         )
 
     def _split_outbound_content(self, content: str) -> list[str]:
-        limit = self.max_message_chars or self.max_message_length or DEFAULT_MAX_MESSAGE_CHARS
-        if len(content) <= limit:
-            return [content]
-
-        chunks: list[str] = []
-        current = ""
-        for block in re.split(r"(\n\s*\n)", content):
-            if len(block) > limit:
-                if current:
-                    chunks.append(current)
-                    current = ""
-                chunks.extend(block[index : index + limit] for index in range(0, len(block), limit))
-                continue
-            if len(current) + len(block) > limit:
-                if current:
-                    chunks.append(current)
-                current = block
-            else:
-                current += block
-        if current:
-            chunks.append(current)
-        return [chunk for chunk in chunks if chunk]
+        return _split_message(
+            content,
+            self.max_message_chars or self.max_message_length or DEFAULT_MAX_MESSAGE_CHARS,
+        )
 
     def _build_send_payload(
         self,
@@ -777,11 +842,9 @@ class ZulipAdapter(BasePlatformAdapter):
         content: str,
         metadata: dict[str, Any],
     ) -> dict[str, Any]:
-        if chat_id.startswith("stream:"):
-            stream_to = metadata.get("zulip_stream_id") or metadata.get("zulip_stream_name")
-            topic = metadata.get("zulip_topic")
-            if not stream_to or not topic:
-                raise ValueError("stream Zulip sends require stream and topic metadata")
+        stream_to = metadata.get("zulip_stream_id") or metadata.get("zulip_stream_name")
+        topic = metadata.get("zulip_topic")
+        if stream_to and topic:
             return {
                 "type": "stream",
                 "to": stream_to,
@@ -789,20 +852,56 @@ class ZulipAdapter(BasePlatformAdapter):
                 "content": content,
             }
 
-        if chat_id.startswith("dm_email:"):
-            to: Any = [chat_id.removeprefix("dm_email:")]
-        elif chat_id.startswith("dm_user:"):
-            to = [int(chat_id.removeprefix("dm_user:"))]
-        elif chat_id.startswith("dm:"):
-            target = chat_id.removeprefix("dm:")
-            if "," in target:
-                to = [int(item) if item.isdigit() else item for item in target.split(",")]
-            else:
-                to = [int(target)] if target.isdigit() else [target]
-        else:
-            raise ValueError(f"Unsupported Zulip chat_id: {chat_id}")
+        if self._is_dm_chat_id(chat_id):
+            metadata_user_id = metadata.get("zulip_sender_id")
+            metadata_email = metadata.get("zulip_sender_email")
+            if metadata_user_id is not None:
+                return {"type": "direct", "to": [_coerce_zulip_target(metadata_user_id)], "content": content}
+            if metadata_email:
+                return {"type": "direct", "to": [_clean_text(metadata_email).lower()], "content": content}
 
-        return {"type": "direct", "to": to, "content": content}
+        if chat_id.startswith("stream:"):
+            stream_to, topic = self._stream_target_from_chat_id(chat_id)
+            return {
+                "type": "stream",
+                "to": stream_to,
+                "topic": topic,
+                "content": content,
+            }
+
+        if self._is_dm_chat_id(chat_id):
+            return {"type": "direct", "to": self._dm_targets_from_chat_id(chat_id), "content": content}
+
+        raise ValueError(f"Unsupported Zulip chat_id: {chat_id}")
+
+    @staticmethod
+    def _is_dm_chat_id(chat_id: str) -> bool:
+        return chat_id.startswith(("dm:", "dm_email:", "dm_user:"))
+
+    @staticmethod
+    def _dm_targets_from_chat_id(chat_id: str) -> list[Any]:
+        if chat_id.startswith("dm_email:"):
+            return [chat_id.removeprefix("dm_email:")]
+        if chat_id.startswith("dm_user:"):
+            return [_coerce_zulip_target(chat_id.removeprefix("dm_user:"))]
+
+        target = chat_id.removeprefix("dm:")
+        if "," in target:
+            return [_coerce_zulip_target(item) for item in target.split(",") if item]
+        return [_coerce_zulip_target(target)]
+
+    @staticmethod
+    def _stream_target_from_chat_id(chat_id: str) -> tuple[Any, str]:
+        prefix = "stream:"
+        topic_marker = ":topic:"
+        if not chat_id.startswith(prefix) or topic_marker not in chat_id:
+            raise ValueError("stream Zulip sends require stream/topic chat_id or metadata")
+        stream_part, topic_part = chat_id[len(prefix) :].split(topic_marker, 1)
+        stream_to = _coerce_zulip_target(unquote(stream_part))
+        topic = unquote(topic_part)
+        if not stream_to or not topic:
+            raise ValueError("stream Zulip sends require stream and topic")
+        return stream_to, topic
 
 
 def _base_credentials_present(config: Any | None = None) -> bool:
@@ -846,6 +945,43 @@ def _env_enablement() -> dict[str, Any] | None:
     return extra
 
 
+async def _standalone_send(
+    pconfig: PlatformConfig,
+    chat_id: str | None,
+    message: str,
+    **kwargs: Any,
+) -> dict[str, Any]:
+    """Send one out-of-process Zulip delivery using an ephemeral HTTP client."""
+    adapter = ZulipAdapter(pconfig)
+    if httpx is None:
+        return {"success": False, "error": "httpx is not available"}
+    if not all((adapter.site_url, adapter.bot_email, adapter.api_key)):
+        return {"success": False, "error": "Zulip credentials are not configured"}
+
+    target_chat_id = _clean_text(chat_id)
+    if not target_chat_id:
+        target_chat_id = _clean_text((adapter.home_channel or {}).get("chat_id"))
+    if not target_chat_id:
+        return {"success": False, "error": "Zulip home DM is not configured"}
+
+    adapter._client = httpx.AsyncClient(auth=(adapter.bot_email, adapter.api_key))
+    try:
+        result = await adapter.send(
+            target_chat_id,
+            message,
+            reply_to=kwargs.get("reply_to"),
+            metadata=kwargs.get("metadata"),
+        )
+        response: dict[str, Any] = {"success": bool(getattr(result, "success", False))}
+        if getattr(result, "error", None):
+            response["error"] = getattr(result, "error")
+        if getattr(result, "message_id", None) is not None:
+            response["message_id"] = getattr(result, "message_id")
+        return response
+    finally:
+        await adapter._close_client()
+
+
 def register(ctx: Any) -> None:
     ctx.register_platform(
         name="zulip",
@@ -860,6 +996,7 @@ def register(ctx: Any) -> None:
         max_message_length=DEFAULT_MAX_MESSAGE_CHARS,
         platform_hint=PLATFORM_HINT,
         emoji="💬",
+        standalone_sender_fn=_standalone_send,
     )
 
 
@@ -874,5 +1011,7 @@ __all__ = [
     "build_source",
     "check_requirements",
     "register",
+    "_split_message",
+    "_standalone_send",
     "validate_config",
 ]
