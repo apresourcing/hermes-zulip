@@ -26,12 +26,16 @@ optional_env:
     description: "Comma-separated Zulip sender user IDs allowed to use Hermes"
     prompt: "Allowed Zulip user IDs"
     password: false
+  - name: ZULIP_HOME_CHANNEL
+    description: "Default Zulip chat_id for cron/background delivery, e.g. dm_user:12345 or stream:12345:topic:Example%20topic"
+    prompt: "Zulip home channel"
+    password: false
   - name: ZULIP_HOME_EMAIL
-    description: "Default Zulip DM email for cron/background delivery"
+    description: "Legacy default Zulip DM email for cron/background delivery"
     prompt: "Zulip home DM email"
     password: false
   - name: ZULIP_HOME_USER_ID
-    description: "Default Zulip DM user ID for cron/background delivery"
+    description: "Legacy default Zulip DM user ID for cron/background delivery"
     prompt: "Zulip home DM user ID"
     password: false
   - name: ZULIP_MAX_MESSAGE_CHARS
