@@ -17,6 +17,10 @@ ZULIP_ENV = {
     "ZULIP_HOME_USER_ID",
     "ZULIP_HOME_CHANNEL",
     "ZULIP_MAX_MESSAGE_CHARS",
+    "ZULIP_ATTACHMENTS_ENABLED",
+    "ZULIP_ATTACHMENT_MAX_BYTES",
+    "ZULIP_ATTACHMENT_MAX_COUNT",
+    "ZULIP_ATTACHMENT_ALLOWED_EXTS",
 }
 
 
@@ -35,9 +39,11 @@ class FakeBasePlatformAdapter:
 
 
 class FakeResponse:
-    def __init__(self, payload, status_error=None):
+    def __init__(self, payload=None, status_error=None, *, content=b"", headers=None):
         self.payload = payload
         self.status_error = status_error
+        self.content = content
+        self.headers = headers or {}
 
     def json(self):
         return self.payload
@@ -858,6 +864,166 @@ async def test_dm_message_and_slash_command_are_accepted(adapter_module):
 
     assert [event.content for event in adapter.events] == ["hello", "/status"]
     assert [_event_source(event)["chat_id"] for event in adapter.events] == ["dm:123", "dm:123"]
+
+
+@pytest.mark.asyncio
+async def test_allowed_image_attachment_is_downloaded_to_cache_and_exposed_as_media(
+    adapter_module,
+    monkeypatch,
+    tmp_path,
+):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    adapter = _make_recording_adapter(adapter_module)
+    adapter._client = FakeAsyncClient(
+        get_responses=[
+            FakeResponse(
+                content=b"fake png bytes",
+                headers={"content-type": "image/png", "content-length": "14"},
+            )
+        ]
+    )
+
+    await adapter._handle_zulip_message_event(
+        _message_event(
+            _base_message(
+                content='Please inspect <a href="/user_uploads/1/ab/screenshot.png">screenshot.png</a>'
+            )
+        )
+    )
+
+    assert len(adapter.events) == 1
+    event = adapter.events[0]
+    assert event.media_types == ["image/png"]
+    assert len(event.media_urls) == 1
+    saved_path = event.media_urls[0]
+    assert saved_path.startswith(str(tmp_path / "gateway" / "incoming" / "zulip" / "1001"))
+    assert saved_path.endswith("screenshot.png")
+    assert (tmp_path / "gateway" / "incoming" / "zulip" / "1001" / "screenshot.png").read_bytes() == b"fake png bytes"
+    assert "[Attachment: screenshot.png]" in event.content
+    assert saved_path in event.content
+    assert adapter._client.get_calls == [
+        (
+            "https://example.zulipchat.com/user_uploads/1/ab/screenshot.png",
+            {"follow_redirects": True},
+        )
+    ]
+
+
+@pytest.mark.asyncio
+async def test_unauthorized_attachment_is_not_downloaded(adapter_module):
+    adapter = _make_recording_adapter(adapter_module)
+    adapter._client = FakeAsyncClient(
+        get_responses=[FakeResponse(content=b"should not be fetched")]
+    )
+
+    await adapter._handle_zulip_message_event(
+        _message_event(
+            _base_message(
+                sender_email="mallory@example.com",
+                sender_id=666,
+                content='look <a href="/user_uploads/1/ab/screenshot.png">screenshot.png</a>',
+            )
+        )
+    )
+
+    assert adapter.events == []
+    assert adapter._client.get_calls == []
+
+
+@pytest.mark.asyncio
+async def test_markdown_attachment_links_are_downloaded_and_filenames_are_sanitized(
+    adapter_module,
+    monkeypatch,
+    tmp_path,
+):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    adapter = _make_recording_adapter(adapter_module)
+    adapter._client = FakeAsyncClient(
+        get_responses=[
+            FakeResponse(content=b"pdf", headers={"content-type": "application/pdf"})
+        ]
+    )
+
+    await adapter._handle_zulip_message_event(
+        _message_event(
+            _base_message(
+                content="review [bad/name.pdf](/user_uploads/1/ab/bad%2Fname.pdf)"
+            )
+        )
+    )
+
+    event = adapter.events[0]
+    assert event.media_types == ["application/pdf"]
+    assert event.media_urls[0].endswith("bad_name.pdf")
+    assert ".." not in event.media_urls[0]
+    assert (tmp_path / "gateway" / "incoming" / "zulip" / "1001" / "bad_name.pdf").read_bytes() == b"pdf"
+
+
+@pytest.mark.asyncio
+async def test_multiple_attachments_respect_count_cap(adapter_module, monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    adapter = _make_recording_adapter(adapter_module, extra={"attachment_max_count": 1})
+    adapter._client = FakeAsyncClient(
+        get_responses=[FakeResponse(content=b"one", headers={"content-type": "text/plain"})]
+    )
+
+    await adapter._handle_zulip_message_event(
+        _message_event(
+            _base_message(
+                content="one /user_uploads/1/ab/one.txt two /user_uploads/1/ab/two.txt"
+            )
+        )
+    )
+
+    event = adapter.events[0]
+    assert len(event.media_urls) == 1
+    assert event.media_urls[0].endswith("one.txt")
+    assert len(adapter._client.get_calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_attachment_download_rejects_external_and_oversized_files(
+    adapter_module,
+    monkeypatch,
+    tmp_path,
+):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    adapter = _make_recording_adapter(
+        adapter_module,
+        extra={"attachment_max_bytes": 5},
+    )
+    adapter._client = FakeAsyncClient(
+        get_responses=[
+            FakeResponse(
+                content=b"too large",
+                headers={"content-type": "image/png", "content-length": "9"},
+            )
+        ]
+    )
+
+    await adapter._handle_zulip_message_event(
+        _message_event(
+            _base_message(
+                content=(
+                    'external <a href="https://evil.example/user_uploads/1/ab/evil.png">evil</a> '
+                    'large <a href="/user_uploads/1/ab/large.png">large.png</a>'
+                )
+            )
+        )
+    )
+
+    assert len(adapter.events) == 1
+    event = adapter.events[0]
+    assert event.media_urls == []
+    assert event.media_types == []
+    assert "[Attachment skipped: large.png exceeds 5 bytes]" in event.content
+    assert adapter._client.get_calls == [
+        (
+            "https://example.zulipchat.com/user_uploads/1/ab/large.png",
+            {"follow_redirects": True},
+        )
+    ]
+    assert not list((tmp_path / "gateway" / "incoming" / "zulip").glob("**/*"))
 
 
 @pytest.mark.asyncio
