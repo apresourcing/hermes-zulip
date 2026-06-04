@@ -380,14 +380,11 @@ def test_register_calls_register_platform_with_zulip_hooks(adapter_module):
 
 
 @pytest.mark.asyncio
-async def test_send_exec_approval_posts_reaction_prompt_and_primes_reactions(adapter_module):
+async def test_send_exec_approval_posts_reaction_prompt_without_bot_reactions(adapter_module):
     adapter = _make_adapter(adapter_module)
     adapter._client = FakeAsyncClient(
         post_responses=[
             FakeResponse({"result": "success", "id": 2001}),
-            FakeResponse({"result": "success"}),
-            FakeResponse({"result": "success"}),
-            FakeResponse({"result": "success"}),
         ]
     )
 
@@ -409,11 +406,7 @@ async def test_send_exec_approval_posts_reaction_prompt_and_primes_reactions(ada
     assert "👎 reject" in content
     assert "rm -rf /tmp/example" in content
     assert adapter._approval_reactions["2001"] == {"session_key": "zulip:session:1"}
-    assert [call[1]["data"]["emoji_name"] for call in adapter._client.post_calls[1:]] == [
-        "thumbs_up",
-        "infinity",
-        "thumbs_down",
-    ]
+    assert len(adapter._client.post_calls) == 1
 
 
 @pytest.mark.asyncio

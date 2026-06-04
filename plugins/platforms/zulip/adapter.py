@@ -441,8 +441,11 @@ class ZulipAdapter(BasePlatformAdapter):
 
         Zulip does not expose Telegram-style inline buttons in the normal bot
         message API. Reactions are reliable across Zulip clients, so this
-        method posts a prompt, primes it with the three reaction options, and
-        resolves the pending Hermes approval when an authorized user reacts.
+        method posts a prompt and resolves the pending Hermes approval when an
+        authorized user adds one of the supported reactions. The bot does not
+        pre-react to its own messages; Zulip shows bot-added reactions as real
+        reactions on the message, which makes normal replies look like approval
+        prompts.
         """
         cmd_preview = command[:200] + "..." if len(command) > 200 else command
         options = " | ".join(f"{emoji} {label}" for _, emoji, label in APPROVAL_REACTION_OPTIONS)
@@ -460,28 +463,7 @@ class ZulipAdapter(BasePlatformAdapter):
         message_id = getattr(result, "message_id", None)
         if message_id is not None:
             self._approval_reactions[str(message_id)] = {"session_key": session_key}
-            await self._prime_approval_reactions(message_id)
         return result
-
-    async def _prime_approval_reactions(self, message_id: Any) -> None:
-        if self._client is None:
-            return
-        for emoji_name, _emoji, _label in APPROVAL_REACTION_OPTIONS:
-            try:
-                response = await self._client.post(
-                    f"{self.api_base}/messages/{message_id}/reactions",
-                    data={"emoji_name": emoji_name},
-                )
-                self._raise_for_status(response)
-                body = response.json()
-                if body.get("result") == "error" and body.get("code") != "REACTION_ALREADY_EXISTS":
-                    logger.debug(
-                        "Zulip approval reaction prime failed for %s: %s",
-                        emoji_name,
-                        body.get("msg") or body.get("code") or "unknown error",
-                    )
-            except Exception as exc:
-                logger.debug("Zulip approval reaction prime failed for %s: %s", emoji_name, _short_error(exc))
 
     async def send_typing(self, chat_id: str, metadata: dict[str, Any] | None = None) -> None:
         """Show Zulip's native typing indicator for the target conversation."""
