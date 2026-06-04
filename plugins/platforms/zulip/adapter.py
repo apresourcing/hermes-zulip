@@ -5,9 +5,11 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import importlib.util
+import json
 import logging
 import os
 import re
+from html import unescape
 from types import SimpleNamespace
 from typing import Any
 from urllib.parse import quote, unquote
@@ -57,6 +59,14 @@ LEADING_ZULIP_MENTION_RE = re.compile(
     r"^\s*@\*\*(?P<name>[^*]+)\*\*\s*:?\s*",
     re.UNICODE,
 )
+
+
+def _zulip_platform() -> Any:
+    """Return a platform object usable by the live gateway and test fakes."""
+    try:
+        return Platform("zulip")
+    except Exception:
+        return getattr(Platform, "ZULIP", SimpleNamespace(value="zulip", name="ZULIP"))
 
 
 def _extra(config: Any) -> dict[str, Any]:
@@ -135,7 +145,7 @@ def _read_configured_max_message_chars(config: Any) -> int | None:
 
 
 
-def _read_home_target(config: Any) -> tuple[str | None, str | None]:
+def _read_legacy_home_target(config: Any) -> tuple[str | None, str | None]:
     extra = _extra(config)
     if "ZULIP_HOME_EMAIL" in os.environ:
         home_email = _clean_text(os.environ.get("ZULIP_HOME_EMAIL"))
@@ -156,6 +166,25 @@ def _home_channel(home_email: str | None, home_user_id: str | None) -> dict[str,
     if home_user_id:
         return {"chat_id": f"dm_user:{home_user_id}", "name": "Zulip Home"}
     return None
+
+
+def _read_home_channel(config: Any) -> dict[str, str] | None:
+    extra = _extra(config)
+    if "ZULIP_HOME_CHANNEL" in os.environ:
+        chat_id = _clean_text(os.environ.get("ZULIP_HOME_CHANNEL"))
+        if chat_id:
+            return {"chat_id": chat_id, "name": "Zulip Home"}
+
+    configured_home_channel = extra.get("home_channel")
+    if isinstance(configured_home_channel, dict):
+        chat_id = _clean_text(configured_home_channel.get("chat_id"))
+        if chat_id:
+            return {
+                "chat_id": chat_id,
+                "name": _clean_text(configured_home_channel.get("name")) or "Zulip Home",
+            }
+
+    return _home_channel(*_read_legacy_home_target(config))
 
 
 def _message_type_text() -> Any:
@@ -271,17 +300,19 @@ class ZulipAdapter(BasePlatformAdapter):
     """Zulip platform integration using the Zulip Events API."""
 
     def __init__(self, config: PlatformConfig):
-        super().__init__(config)
+        platform = _zulip_platform()
+        try:
+            super().__init__(config=config, platform=platform)
+        except TypeError:
+            super().__init__(config)
+            self.platform = platform
         self.config = config
         self.site_url, self.bot_email, self.api_key = _read_required(config)
         self.api_base = f"{self.site_url}/api/v1" if self.site_url else ""
         self.allowed_emails = _read_allowed_emails(config)
         self.allowed_user_ids = _read_allowed_user_ids(config)
-        self.home_email, self.home_user_id = _read_home_target(config)
-        configured_home_channel = _extra(config).get("home_channel")
-        self.home_channel = _home_channel(self.home_email, self.home_user_id) or (
-            configured_home_channel if isinstance(configured_home_channel, dict) else None
-        )
+        self.home_email, self.home_user_id = _read_legacy_home_target(config)
+        self.home_channel = _read_home_channel(config)
         self._max_message_chars_configured = (
             _read_configured_max_message_chars(config) is not None
         )
@@ -376,6 +407,88 @@ class ZulipAdapter(BasePlatformAdapter):
 
         return _send_result(True, message_id=last_message_id)
 
+    async def send_typing(self, chat_id: str, metadata: dict[str, Any] | None = None) -> None:
+        """Show Zulip's native typing indicator for the target conversation."""
+        await self._send_typing_op(chat_id, "start", metadata=metadata)
+
+    async def stop_typing(self, chat_id: str, metadata: dict[str, Any] | None = None) -> None:
+        """Stop Zulip's native typing indicator for the target conversation."""
+        await self._send_typing_op(chat_id, "stop", metadata=metadata)
+
+    async def _send_typing_op(
+        self,
+        chat_id: str,
+        op: str,
+        *,
+        metadata: dict[str, Any] | None = None,
+    ) -> None:
+        if self._client is None:
+            return
+
+        try:
+            payload = self._build_typing_payload(chat_id, op, metadata or {})
+            if payload is None:
+                return
+            response = await self._client.post(f"{self.api_base}/typing", data=payload)
+            self._raise_for_status(response)
+            body = response.json()
+            if body.get("result") == "error":
+                logger.debug(
+                    "Zulip typing %s failed: %s",
+                    op,
+                    body.get("msg") or body.get("code") or "unknown error",
+                )
+        except Exception as exc:
+            logger.debug("Zulip typing %s failed: %s", op, _short_error(exc))
+
+    def _build_typing_payload(
+        self,
+        chat_id: str,
+        op: str,
+        metadata: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        stream_id = metadata.get("zulip_stream_id")
+        topic = metadata.get("zulip_topic")
+        if stream_id is not None and topic:
+            stream_id = _parse_positive_int(stream_id)
+            if stream_id is not None:
+                return {"type": "stream", "op": op, "stream_id": stream_id, "topic": topic}
+
+        if chat_id.startswith("stream:"):
+            stream_target, topic = self._stream_target_from_chat_id(chat_id)
+            stream_id = _parse_positive_int(stream_target)
+            if stream_id is None:
+                logger.debug("Skipping Zulip typing for non-numeric stream target: %s", stream_target)
+                return None
+            return {"type": "stream", "op": op, "stream_id": stream_id, "topic": topic}
+
+        if self._is_dm_chat_id(chat_id):
+            targets = self._typing_dm_targets(chat_id, metadata)
+            if not targets:
+                return None
+            return {"type": "direct", "op": op, "to": json.dumps(targets)}
+
+        return None
+
+    def _typing_dm_targets(self, chat_id: str, metadata: dict[str, Any]) -> list[int]:
+        metadata_user_id = _parse_positive_int(metadata.get("zulip_sender_id"))
+        if metadata_user_id is not None:
+            return [metadata_user_id]
+
+        numeric_targets: list[int] = []
+        for target in self._dm_targets_from_chat_id(chat_id):
+            target_id = _parse_positive_int(target)
+            if target_id is None:
+                logger.debug("Skipping Zulip typing for non-numeric DM target: %s", target)
+                return []
+            numeric_targets.append(target_id)
+        return numeric_targets
+
+    @property
+    def enforces_own_access_policy(self) -> bool:
+        """Zulip gates inbound access at intake via email/user-id allowlists."""
+        return True
+
     async def _register_event_queue(self) -> dict[str, Any]:
         """Register a Zulip queue scoped to message events and store queue state."""
         if self._client is None:
@@ -383,7 +496,7 @@ class ZulipAdapter(BasePlatformAdapter):
 
         response = await self._client.post(
             f"{self.api_base}/register",
-            data={"event_types": ["message"], "apply_markdown": "false"},
+            data={"event_types": json.dumps(["message"]), "apply_markdown": "false"},
         )
         self._raise_for_status(response)
         payload = response.json()
@@ -631,11 +744,10 @@ class ZulipAdapter(BasePlatformAdapter):
         if self._is_direct_reply_to_bot(event, message):
             return True, content
 
-        mentioned = self._has_bot_mention(message, content)
-        if not mentioned:
-            return False, content
+        if self._has_bot_mention(message, content):
+            return True, self._strip_leading_bot_mention(content)
 
-        return True, self._strip_leading_bot_mention(content)
+        return True, content
 
     def _has_bot_mention(self, message: dict[str, Any], content: str) -> bool:
         flags = {
@@ -715,8 +827,9 @@ class ZulipAdapter(BasePlatformAdapter):
             chat_id=chat_id,
             chat_name=chat_name,
             chat_type=chat_type,
-            user_id=_clean_text(message.get("sender_id")),
+            user_id=_clean_text(message.get("sender_id")) or _clean_text(message.get("sender_email")).lower(),
             user_name=_clean_text(message.get("sender_full_name") or message.get("sender_email")),
+            user_id_alt=_clean_text(message.get("sender_email")).lower() or None,
             metadata=metadata,
         )
         message_type = _message_type_text()
@@ -759,23 +872,33 @@ class ZulipAdapter(BasePlatformAdapter):
         chat_type: str,
         user_id: str,
         user_name: str,
+        user_id_alt: str | None,
         metadata: dict[str, Any],
     ) -> Any:
-        kwargs = {
-            "platform": "zulip",
+        source_kwargs = {
             "chat_id": chat_id,
             "chat_name": chat_name,
             "chat_type": chat_type,
             "user_id": user_id,
             "user_name": user_name,
-            "metadata": metadata,
+            "user_id_alt": user_id_alt or None,
+            "thread_id": metadata.get("zulip_topic"),
+            "message_id": metadata.get("zulip_message_id"),
         }
-        if callable(build_source):
+        local_builder = getattr(self, "build_source", None)
+        if callable(local_builder):
             try:
-                return build_source(**kwargs)
+                return local_builder(**source_kwargs)
             except Exception:
                 pass
-        return kwargs
+
+        fallback_kwargs = {"platform": "zulip", **source_kwargs}
+        if callable(build_source):
+            try:
+                return build_source(**fallback_kwargs)
+            except Exception:
+                pass
+        return {**fallback_kwargs, "metadata": metadata}
 
     def _source_metadata(self, message: dict[str, Any]) -> dict[str, Any]:
         return {
@@ -791,17 +914,21 @@ class ZulipAdapter(BasePlatformAdapter):
         }
 
     def _dm_chat_id(self, message: dict[str, Any]) -> str:
-        recipient_id = message.get("recipient_id")
-        if recipient_id is not None:
-            return f"dm:{recipient_id}"
-        user_ids = _display_recipient_user_ids(message.get("display_recipient"))
-        if user_ids:
-            return f"dm:{','.join(user_ids)}"
         sender_id = message.get("sender_id")
         if sender_id is not None:
             return f"dm:{sender_id}"
+        user_ids = _display_recipient_user_ids(message.get("display_recipient"))
+        if user_ids:
+            bot_id = self.bot_user_id
+            human_user_ids = [user_id for user_id in user_ids if user_id != bot_id]
+            return f"dm:{','.join(human_user_ids or user_ids)}"
         sender_email = _clean_text(message.get("sender_email")).lower()
-        return f"dm:{sender_email}"
+        if sender_email:
+            return f"dm:{sender_email}"
+        recipient_id = message.get("recipient_id")
+        if recipient_id is not None:
+            return f"dm:{recipient_id}"
+        return "dm:unknown"
 
     def _dm_chat_name(self, message: dict[str, Any]) -> str:
         return _display_recipient_name(message.get("display_recipient")) or _clean_text(
@@ -847,7 +974,7 @@ class ZulipAdapter(BasePlatformAdapter):
         if stream_to and topic:
             return {
                 "type": "stream",
-                "to": stream_to,
+                "to": json.dumps(stream_to),
                 "topic": topic,
                 "content": content,
             }
@@ -856,21 +983,21 @@ class ZulipAdapter(BasePlatformAdapter):
             metadata_user_id = metadata.get("zulip_sender_id")
             metadata_email = metadata.get("zulip_sender_email")
             if metadata_user_id is not None:
-                return {"type": "direct", "to": [_coerce_zulip_target(metadata_user_id)], "content": content}
+                return {"type": "direct", "to": json.dumps([_coerce_zulip_target(metadata_user_id)]), "content": content}
             if metadata_email:
-                return {"type": "direct", "to": [_clean_text(metadata_email).lower()], "content": content}
+                return {"type": "direct", "to": json.dumps([_clean_text(metadata_email).lower()]), "content": content}
 
         if chat_id.startswith("stream:"):
             stream_to, topic = self._stream_target_from_chat_id(chat_id)
             return {
                 "type": "stream",
-                "to": stream_to,
+                "to": json.dumps(stream_to),
                 "topic": topic,
                 "content": content,
             }
 
         if self._is_dm_chat_id(chat_id):
-            return {"type": "direct", "to": self._dm_targets_from_chat_id(chat_id), "content": content}
+            return {"type": "direct", "to": json.dumps(self._dm_targets_from_chat_id(chat_id)), "content": content}
 
         raise ValueError(f"Unsupported Zulip chat_id: {chat_id}")
 
@@ -902,6 +1029,18 @@ class ZulipAdapter(BasePlatformAdapter):
         if not stream_to or not topic:
             raise ValueError("stream Zulip sends require stream and topic")
         return stream_to, topic
+
+    async def get_chat_info(self, chat_id: str) -> dict[str, Any]:
+        """Return minimal chat metadata for Hermes session display/recovery."""
+        if chat_id.startswith("stream:"):
+            try:
+                stream_to, topic = self._stream_target_from_chat_id(chat_id)
+                return {"name": f"{stream_to} / {topic}", "type": "group"}
+            except Exception:
+                return {"name": chat_id, "type": "group"}
+        if self._is_dm_chat_id(chat_id):
+            return {"name": "Zulip DM", "type": "dm"}
+        return {"name": chat_id, "type": "channel"}
 
 
 def _base_credentials_present(config: Any | None = None) -> bool:
@@ -937,8 +1076,7 @@ def _env_enablement() -> dict[str, Any] | None:
     if max_message_chars is not None:
         extra["max_message_chars"] = max_message_chars
 
-    home_email, home_user_id = _read_home_target(config)
-    home_channel = _home_channel(home_email, home_user_id)
+    home_channel = _read_home_channel(config)
     if home_channel:
         extra["home_channel"] = home_channel
 
@@ -991,8 +1129,8 @@ def register(ctx: Any) -> None:
         validate_config=validate_config,
         required_env=REQUIRED_ENV,
         env_enablement_fn=_env_enablement,
-        cron_deliver_env_var="ZULIP_HOME_EMAIL",
-        allowed_users_env="ZULIP_ALLOWED_EMAILS",
+        cron_deliver_env_var="ZULIP_HOME_CHANNEL",
+        allowed_users_env="ZULIP_ALLOWED_USER_IDS",
         max_message_length=DEFAULT_MAX_MESSAGE_CHARS,
         platform_hint=PLATFORM_HINT,
         emoji="💬",
