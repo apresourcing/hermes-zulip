@@ -960,6 +960,80 @@ async def test_send_dm_uses_metadata_sender_before_canonical_chat_id(adapter_mod
 
 
 @pytest.mark.asyncio
+async def test_send_typing_stream_uses_metadata_target(adapter_module):
+    adapter = _make_adapter(adapter_module)
+    adapter._client = FakeAsyncClient(
+        post_responses=[FakeResponse({"result": "success"})]
+    )
+
+    await adapter.send_typing(
+        "stream:ignored:topic:ignored",
+        metadata={"zulip_stream_id": 42, "zulip_topic": "release plan"},
+    )
+
+    assert adapter._client.post_calls == [
+        (
+            "https://example.zulipchat.com/api/v1/typing",
+            {"data": {"type": "stream", "op": "start", "stream_id": 42, "topic": "release plan"}},
+        )
+    ]
+
+
+@pytest.mark.asyncio
+async def test_stop_typing_stream_falls_back_to_canonical_chat_id(adapter_module):
+    adapter = _make_adapter(adapter_module)
+    adapter._client = FakeAsyncClient(
+        post_responses=[FakeResponse({"result": "success"})]
+    )
+
+    await adapter.stop_typing("stream:42:topic:release%20plan")
+
+    assert adapter._client.post_calls == [
+        (
+            "https://example.zulipchat.com/api/v1/typing",
+            {"data": {"type": "stream", "op": "stop", "stream_id": 42, "topic": "release plan"}},
+        )
+    ]
+
+
+@pytest.mark.asyncio
+async def test_send_typing_direct_uses_numeric_targets(adapter_module):
+    adapter = _make_adapter(adapter_module)
+    adapter._client = FakeAsyncClient(
+        post_responses=[FakeResponse({"result": "success"})]
+    )
+
+    await adapter.send_typing("dm_user:123")
+
+    assert adapter._client.post_calls == [
+        (
+            "https://example.zulipchat.com/api/v1/typing",
+            {"data": {"type": "direct", "op": "start", "to": "[123]"}},
+        )
+    ]
+
+
+@pytest.mark.asyncio
+async def test_send_typing_ignores_unresolvable_email_targets(adapter_module):
+    adapter = _make_adapter(adapter_module)
+    adapter._client = FakeAsyncClient()
+
+    await adapter.send_typing("dm_email:owner@example.com")
+
+    assert adapter._client.post_calls == []
+
+
+@pytest.mark.asyncio
+async def test_send_typing_swallows_zulip_errors(adapter_module):
+    adapter = _make_adapter(adapter_module)
+    adapter._client = FakeAsyncClient(post_responses=[RuntimeError("network down")])
+
+    await adapter.send_typing("stream:42:topic:release%20plan")
+
+    assert len(adapter._client.post_calls) == 1
+
+
+@pytest.mark.asyncio
 async def test_send_splits_long_content_without_part_prefixes(adapter_module):
     adapter = _make_adapter(adapter_module)
     adapter.max_message_chars = 12

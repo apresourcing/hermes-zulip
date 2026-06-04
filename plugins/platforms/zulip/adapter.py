@@ -407,6 +407,83 @@ class ZulipAdapter(BasePlatformAdapter):
 
         return _send_result(True, message_id=last_message_id)
 
+    async def send_typing(self, chat_id: str, metadata: dict[str, Any] | None = None) -> None:
+        """Show Zulip's native typing indicator for the target conversation."""
+        await self._send_typing_op(chat_id, "start", metadata=metadata)
+
+    async def stop_typing(self, chat_id: str, metadata: dict[str, Any] | None = None) -> None:
+        """Stop Zulip's native typing indicator for the target conversation."""
+        await self._send_typing_op(chat_id, "stop", metadata=metadata)
+
+    async def _send_typing_op(
+        self,
+        chat_id: str,
+        op: str,
+        *,
+        metadata: dict[str, Any] | None = None,
+    ) -> None:
+        if self._client is None:
+            return
+
+        try:
+            payload = self._build_typing_payload(chat_id, op, metadata or {})
+            if payload is None:
+                return
+            response = await self._client.post(f"{self.api_base}/typing", data=payload)
+            self._raise_for_status(response)
+            body = response.json()
+            if body.get("result") == "error":
+                logger.debug(
+                    "Zulip typing %s failed: %s",
+                    op,
+                    body.get("msg") or body.get("code") or "unknown error",
+                )
+        except Exception as exc:
+            logger.debug("Zulip typing %s failed: %s", op, _short_error(exc))
+
+    def _build_typing_payload(
+        self,
+        chat_id: str,
+        op: str,
+        metadata: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        stream_id = metadata.get("zulip_stream_id")
+        topic = metadata.get("zulip_topic")
+        if stream_id is not None and topic:
+            stream_id = _parse_positive_int(stream_id)
+            if stream_id is not None:
+                return {"type": "stream", "op": op, "stream_id": stream_id, "topic": topic}
+
+        if chat_id.startswith("stream:"):
+            stream_target, topic = self._stream_target_from_chat_id(chat_id)
+            stream_id = _parse_positive_int(stream_target)
+            if stream_id is None:
+                logger.debug("Skipping Zulip typing for non-numeric stream target: %s", stream_target)
+                return None
+            return {"type": "stream", "op": op, "stream_id": stream_id, "topic": topic}
+
+        if self._is_dm_chat_id(chat_id):
+            targets = self._typing_dm_targets(chat_id, metadata)
+            if not targets:
+                return None
+            return {"type": "direct", "op": op, "to": json.dumps(targets)}
+
+        return None
+
+    def _typing_dm_targets(self, chat_id: str, metadata: dict[str, Any]) -> list[int]:
+        metadata_user_id = _parse_positive_int(metadata.get("zulip_sender_id"))
+        if metadata_user_id is not None:
+            return [metadata_user_id]
+
+        numeric_targets: list[int] = []
+        for target in self._dm_targets_from_chat_id(chat_id):
+            target_id = _parse_positive_int(target)
+            if target_id is None:
+                logger.debug("Skipping Zulip typing for non-numeric DM target: %s", target)
+                return []
+            numeric_targets.append(target_id)
+        return numeric_targets
+
     @property
     def enforces_own_access_policy(self) -> bool:
         """Zulip gates inbound access at intake via email/user-id allowlists."""
