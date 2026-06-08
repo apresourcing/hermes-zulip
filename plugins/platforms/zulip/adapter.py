@@ -669,11 +669,15 @@ class ZulipAdapter(BasePlatformAdapter):
             },
             timeout=self.event_queue_longpoll_timeout_seconds + 10,
         )
+        if self._is_stale_event_queue_response(response):
+            logger.warning("Zulip event queue expired or was rejected; registering a fresh queue")
+            await self._register_event_queue()
+            return
         self._raise_for_status(response)
         payload = response.json()
 
         if payload.get("result") == "error":
-            if payload.get("code") == "BAD_EVENT_QUEUE_ID":
+            if self._is_stale_event_queue_payload(payload):
                 logger.warning("Zulip event queue expired; registering a fresh queue")
                 await self._register_event_queue()
                 return
@@ -865,6 +869,28 @@ class ZulipAdapter(BasePlatformAdapter):
         raise_for_status = getattr(response, "raise_for_status", None)
         if callable(raise_for_status):
             raise_for_status()
+
+    @staticmethod
+    def _is_stale_event_queue_payload(payload: Any) -> bool:
+        if not isinstance(payload, dict):
+            return False
+        code = _clean_text(payload.get("code")).upper()
+        msg = _clean_text(payload.get("msg") or payload.get("message")).lower()
+        return (
+            code == "BAD_EVENT_QUEUE_ID"
+            or "bad event queue" in msg
+            or ("event queue" in msg and "invalid" in msg)
+        )
+
+    def _is_stale_event_queue_response(self, response: Any) -> bool:
+        status_code = getattr(response, "status_code", None)
+        if status_code != 400:
+            return False
+        try:
+            payload = response.json()
+        except Exception:
+            return False
+        return self._is_stale_event_queue_payload(payload)
 
     @staticmethod
     def _coerce_event_id(value: Any) -> int | None:

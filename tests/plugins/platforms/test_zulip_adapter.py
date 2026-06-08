@@ -39,11 +39,20 @@ class FakeBasePlatformAdapter:
 
 
 class FakeResponse:
-    def __init__(self, payload=None, status_error=None, *, content=b"", headers=None):
+    def __init__(
+        self,
+        payload=None,
+        status_error=None,
+        *,
+        content=b"",
+        headers=None,
+        status_code=200,
+    ):
         self.payload = payload
         self.status_error = status_error
         self.content = content
         self.headers = headers or {}
+        self.status_code = status_code
 
     def json(self):
         return self.payload
@@ -633,6 +642,63 @@ async def test_poll_once_reregisters_on_bad_event_queue_id(adapter_module):
     assert adapter.queue_id == "queue-2"
     assert adapter.last_event_id == 500
     assert len(adapter._client.post_calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_poll_once_reregisters_on_http_400_bad_event_queue_id(adapter_module):
+    adapter = _make_adapter(adapter_module)
+    adapter._client = FakeAsyncClient(
+        post_responses=[
+            FakeResponse(
+                {
+                    "result": "success",
+                    "queue_id": "queue-2",
+                    "last_event_id": 500,
+                }
+            )
+        ],
+        get_responses=[
+            FakeResponse(
+                {
+                    "result": "error",
+                    "code": "BAD_EVENT_QUEUE_ID",
+                    "msg": "Bad event queue ID: queue-1",
+                },
+                status_error=RuntimeError("400 Bad Request"),
+                status_code=400,
+            )
+        ],
+    )
+    adapter.queue_id = "queue-1"
+    adapter.last_event_id = 41
+
+    await adapter._poll_once()
+
+    assert adapter.queue_id == "queue-2"
+    assert adapter.last_event_id == 500
+    assert len(adapter._client.post_calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_poll_once_raises_non_queue_http_400(adapter_module):
+    adapter = _make_adapter(adapter_module)
+    adapter._client = FakeAsyncClient(
+        get_responses=[
+            FakeResponse(
+                {"result": "error", "code": "BAD_REQUEST", "msg": "something else"},
+                status_error=RuntimeError("400 Bad Request"),
+                status_code=400,
+            )
+        ],
+    )
+    adapter.queue_id = "queue-1"
+    adapter.last_event_id = 41
+
+    with pytest.raises(RuntimeError, match="400 Bad Request"):
+        await adapter._poll_once()
+
+    assert adapter.queue_id == "queue-1"
+    assert adapter._client.post_calls == []
 
 
 @pytest.mark.asyncio
