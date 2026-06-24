@@ -142,7 +142,7 @@ def clean_zulip_env(monkeypatch):
 def _set_base_env(monkeypatch):
     monkeypatch.setenv("ZULIP_SITE_URL", "https://example.zulipchat.com/")
     monkeypatch.setenv("ZULIP_BOT_EMAIL", "bot@example.com")
-    monkeypatch.setenv("ZULIP_API_KEY", "secret")
+    monkeypatch.setenv("ZULIP_API_KEY", "test-api-key")
 
 
 def _patch_httpx_client(adapter_module, monkeypatch, *, post_responses=None, get_responses=None):
@@ -168,7 +168,7 @@ def _make_adapter(adapter_module):
             extra={
                 "site_url": "https://example.zulipchat.com/",
                 "bot_email": "bot@example.com",
-                "api_key": "secret",
+                "api_key": "test-api-key",  # pragma: allowlist secret
                 "allowed_emails": ["alice@example.com"],
             }
         )
@@ -186,7 +186,7 @@ def test_adapter_initialization_reads_env_before_config_extra(adapter_module, mo
         extra={
             "site_url": "https://ignored.example.com",
             "bot_email": "ignored@example.com",
-            "api_key": "ignored",
+            "api_key": "ignored",  # pragma: allowlist secret
             "allowed_emails": ["ignored@example.com"],
             "allowed_user_ids": ["999"],
             "home_email": "ignored@example.com",
@@ -198,7 +198,7 @@ def test_adapter_initialization_reads_env_before_config_extra(adapter_module, mo
 
     assert adapter.site_url == "https://example.zulipchat.com"
     assert adapter.bot_email == "bot@example.com"
-    assert adapter.api_key == "secret"
+    assert adapter.api_key == "test-api-key"  # pragma: allowlist secret
     assert adapter.allowed_emails == {"alice@example.com", "bob@example.com"}
     assert adapter.allowed_user_ids == {"123", "456"}
     assert adapter.home_email == "Owner@Example.com"
@@ -214,7 +214,7 @@ def test_adapter_initialization_uses_config_extra_as_fallback(adapter_module):
         extra={
             "site_url": "https://example.zulipchat.com/",
             "bot_email": "bot@example.com",
-            "api_key": "secret",
+            "api_key": "test-api-key",  # pragma: allowlist secret
             "allowed_emails": ["Alice@Example.com"],
             "allowed_user_ids": ["123"],
             "home_user_id": "456",
@@ -277,7 +277,7 @@ def test_validate_config_accepts_credentials_and_ignores_missing_allowlist(
         extra={
             "site_url": "https://example.zulipchat.com/",
             "bot_email": "bot@example.com",
-            "api_key": "secret",
+            "api_key": "test-api-key",  # pragma: allowlist secret
         }
     )
 
@@ -313,7 +313,7 @@ def test_env_enablement_seeds_extras_and_email_home_channel(
     assert extras == {
         "site_url": "https://example.zulipchat.com",
         "bot_email": "bot@example.com",
-        "api_key": "secret",
+        "api_key": "test-api-key",  # pragma: allowlist secret
         "allowed_emails": ["alice@example.com", "bob@example.com"],
         "allowed_user_ids": ["123", "456"],
         "max_message_chars": 4096,
@@ -515,7 +515,7 @@ async def test_connect_registers_queue_stores_state_and_marks_connected(
     assert await adapter.connect() is True
 
     client = FakeAsyncClient.instances[0]
-    assert client.auth == ("bot@example.com", "secret")
+    assert client.auth == ("bot@example.com", "test-api-key")
     assert client.post_calls == [
         (
             "https://example.zulipchat.com/api/v1/register",
@@ -727,7 +727,7 @@ def _make_recording_adapter(adapter_module, *, extra=None):
     config_extra = {
         "site_url": "https://example.zulipchat.com/",
         "bot_email": "bot@example.com",
-        "api_key": "secret",
+        "api_key": "test-api-key",  # pragma: allowlist secret
         "allowed_emails": ["alice@example.com"],
     }
     if extra:
@@ -852,7 +852,7 @@ async def test_missing_allowlist_fails_closed_and_logs_no_message_body_or_api_ke
     assert sent[0][2]["zulip_sender_email"] == "alice@example.com"
     assert "private request body" not in caplog.text
     assert "sensitive stream body" not in caplog.text
-    assert "secret" not in caplog.text
+    assert "test-api-key" not in caplog.text
 
 
 @pytest.mark.asyncio
@@ -1413,7 +1413,7 @@ async def test_standalone_sender_uses_home_dm_and_closes_client(adapter_module, 
         extra={
             "site_url": "https://example.zulipchat.com/",
             "bot_email": "bot@example.com",
-            "api_key": "secret",
+            "api_key": "test-api-key",  # pragma: allowlist secret
             "home_email": "owner@example.com",
         }
     )
@@ -1451,7 +1451,7 @@ async def test_standalone_sender_fails_clearly_without_home_target(
         extra={
             "site_url": "https://example.zulipchat.com/",
             "bot_email": "bot@example.com",
-            "api_key": "secret",
+            "api_key": "test-api-key",  # pragma: allowlist secret
         }
     )
 

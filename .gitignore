@@ -1,0 +1,26 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Test/cache output
+.pytest_cache/
+.coverage
+htmlcov/
+.ruff_cache/
+.mypy_cache/
+
+# Virtualenvs
+.venv/
+venv/
+
+# Build/package output
+build/
+dist/
+*.egg-info/
+
+# Local config/secrets
+.env
+.env.*
+!.env.example
+*.log
