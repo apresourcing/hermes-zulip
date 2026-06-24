@@ -42,3 +42,15 @@ optional_env:
     description: "Optional maximum outbound Zulip message length before splitting"
     prompt: "Zulip max message chars"
     password: false
+  - name: ZULIP_ATTACHMENT_MAX_BYTES
+    description: "Maximum downloaded attachment size in bytes"
+    prompt: "Zulip attachment max bytes"
+    password: false
+  - name: ZULIP_ATTACHMENT_MAX_COUNT
+    description: "Maximum number of attachments to materialize from one message"
+    prompt: "Zulip attachment max count"
+    password: false
+  - name: ZULIP_ATTACHMENT_ALLOWED_EXTS
+    description: "Comma-separated list of allowed attachment extensions"
+    prompt: "Zulip attachment allowed extensions"
+    password: false
