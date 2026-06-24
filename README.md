@@ -4,6 +4,10 @@ Zulip platform plugin for [Hermes Agent](https://github.com/NousResearch/hermes-
 
 This plugin lets Hermes receive and send Zulip messages through a Zulip bot account using the Zulip Events API. It is a runtime plugin, not a patch to Hermes core.
 
+# Yours to use
+
+I'm not going to be following the normal OSS route for this. No issues, I won't accept PRs etc. So fork it, and do what you want with it.
+
 ## Features
 
 - Zulip bot-account authentication with `ZULIP_BOT_EMAIL` and `ZULIP_API_KEY`
