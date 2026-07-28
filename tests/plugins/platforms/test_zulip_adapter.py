@@ -521,7 +521,7 @@ async def test_connect_registers_queue_stores_state_and_marks_connected(
 
     adapter._poll_loop = idle_poll_loop
 
-    assert await adapter.connect() is True
+    assert await adapter.connect(is_reconnect=True) is True
 
     client = FakeAsyncClient.instances[0]
     assert client.auth == ("bot@example.com", "test-api-key")
