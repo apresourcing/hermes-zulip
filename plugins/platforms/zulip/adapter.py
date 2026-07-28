@@ -406,7 +406,7 @@ class ZulipAdapter(BasePlatformAdapter):
         self._stop_polling: asyncio.Event | None = None
         self._approval_reactions: dict[str, dict[str, str]] = {}
 
-    async def connect(self) -> bool:
+    async def connect(self, *, is_reconnect: bool = False) -> bool:
         """Create the Zulip HTTP client, register an event queue, and start polling."""
         if not all((self.site_url, self.bot_email, self.api_key)):
             logger.error("Zulip connection requires site URL, bot email, and API key")
