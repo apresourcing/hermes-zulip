@@ -10,11 +10,16 @@ This plugin lets Hermes receive and send Zulip messages through a Zulip bot acco
 - Events API long polling for inbound messages and reactions
 - Fail-closed inbound authorization with email or user-ID allowlists
 - Zulip DM and stream/topic conversations
+- Multi-profile mention routing: each Hermes bot only responds to its own `ZULIP_BOT_FULL_NAME` mention when several share a stream
+- Optional "respond to all authorized stream messages" mode for dedicated bot streams
 - Markdown replies with long-message splitting
 - Home, cron, and background delivery through `ZULIP_HOME_CHANNEL`
 - Native Zulip typing indicators
 - Inbound attachment materialization for supported file types
-- Reaction-based command approvals
+- Outbound file and image uploads via `/user_uploads` with clickable Markdown links
+- Optional public attachment mirror (content-addressed SHA-256 URLs) for external services such as FAL
+- Reaction-based command approvals: 👍 once, ✅ session, ♾️ all pending, 👎 reject
+- Stale event-queue recovery on reconnect
 
 ## Installation
 
@@ -47,6 +52,16 @@ If both allowlists are empty, inbound messages are rejected.
 ```bash
 ZULIP_HOME_CHANNEL=dm_user:12345
 ZULIP_MAX_MESSAGE_CHARS=8000
+
+# Multi-profile mention routing: pick one alias per bot profile.
+ZULIP_BOT_FULL_NAME="Hermes Product Manager"
+
+# Respond to every stream message from an authorized sender, no @-mention needed.
+ZULIP_RESPOND_TO_ALL_AUTHORIZED_STREAM_MESSAGES=true
+
+# Public attachment mirror for external services (e.g. FAL) to fetch inbound images.
+ZULIP_ATTACHMENT_PUBLIC_BASE_URL=https://cdn.example.com/hermes-zulip
+ZULIP_ATTACHMENT_PUBLIC_DIR=/var/www/hermes-zulip
 ```
 
 Legacy home delivery variables are also supported:

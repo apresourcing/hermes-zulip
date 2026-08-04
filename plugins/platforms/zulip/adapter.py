@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import hashlib
 import importlib.util
 import json
 import logging
@@ -69,6 +70,7 @@ MENTION_FLAGS = {"mentioned", "wildcard_mentioned"}
 DIRECT_MESSAGE_TYPES = {"direct", "private", "dm"}
 APPROVAL_REACTION_OPTIONS = (
     ("thumbs_up", "👍", "approve once"),
+    ("white_check_mark", "✅", "approve session"),
     ("infinity", "♾️", "approve all"),
     ("thumbs_down", "👎", "reject"),
 )
@@ -77,6 +79,11 @@ APPROVAL_REACTION_CHOICES = {
     "+1": ("once", False),
     "1f44d": ("once", False),
     "👍": ("once", False),
+    "white_check_mark": ("session", False),
+    "heavy_check_mark": ("session", False),
+    "check": ("session", False),
+    "2705": ("session", False),
+    "✅": ("session", False),
     "thumbs_down": ("deny", False),
     "-1": ("deny", False),
     "1f44e": ("deny", False),
@@ -168,6 +175,21 @@ def _read_allowed_user_ids(config: Any) -> set[str]:
     return _split_values(value)
 
 
+def _parse_bool(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    return _clean_text(value).lower() in {"1", "true", "yes", "on"}
+
+
+def _read_respond_to_all_authorized_stream_messages(config: Any) -> bool:
+    value = _read_setting(
+        config,
+        "ZULIP_RESPOND_TO_ALL_AUTHORIZED_STREAM_MESSAGES",
+        "respond_to_all_authorized_stream_messages",
+    )
+    return _parse_bool(value)
+
+
 def _parse_positive_int(value: Any) -> int | None:
     try:
         parsed = int(str(value).strip())
@@ -217,6 +239,26 @@ def _read_attachment_allowed_exts(config: Any) -> set[str]:
     if not values:
         return set(DEFAULT_ATTACHMENT_ALLOWED_EXTS)
     return {item if item.startswith(".") else f".{item}" for item in values}
+
+
+def _read_attachment_public_base_url(config: Any) -> str | None:
+    value = _read_setting(
+        config,
+        "ZULIP_ATTACHMENT_PUBLIC_BASE_URL",
+        "attachment_public_base_url",
+    )
+    cleaned = _clean_text(value).rstrip("/")
+    return cleaned or None
+
+
+def _read_attachment_public_dir(config: Any) -> Path | None:
+    value = _read_setting(
+        config,
+        "ZULIP_ATTACHMENT_PUBLIC_DIR",
+        "attachment_public_dir",
+    )
+    cleaned = _clean_text(value)
+    return Path(cleaned).expanduser() if cleaned else None
 
 
 def _read_legacy_home_target(config: Any) -> tuple[str | None, str | None]:
@@ -344,7 +386,13 @@ def _hard_split(content: str, limit: int) -> list[str]:
 
 
 def _normalize_name(value: Any) -> str:
-    return re.sub(r"\s+", " ", _clean_text(value).lower())
+    text = _clean_text(value)
+    # Zulip mention Markdown can include an explicit user id in the display text
+    # on some API/code paths: @**Full Name|12345**.  The human-facing bot name
+    # is the stable part we need for profile routing.
+    if "|" in text:
+        text = text.split("|", 1)[0]
+    return re.sub(r"\s+", " ", text.lower())
 
 
 def _display_recipient_user_ids(display_recipient: Any) -> list[str]:
@@ -385,6 +433,9 @@ class ZulipAdapter(BasePlatformAdapter):
         self.api_base = f"{self.site_url}/api/v1" if self.site_url else ""
         self.allowed_emails = _read_allowed_emails(config)
         self.allowed_user_ids = _read_allowed_user_ids(config)
+        self.respond_to_all_authorized_stream_messages = (
+            _read_respond_to_all_authorized_stream_messages(config)
+        )
         self.home_email, self.home_user_id = _read_legacy_home_target(config)
         self.home_channel = _read_home_channel(config)
         self._max_message_chars_configured = (
@@ -394,19 +445,25 @@ class ZulipAdapter(BasePlatformAdapter):
         self.attachment_max_bytes = _read_attachment_max_bytes(config)
         self.attachment_max_count = _read_attachment_max_count(config)
         self.attachment_allowed_exts = _read_attachment_allowed_exts(config)
+        self.attachment_public_base_url = _read_attachment_public_base_url(config)
+        self.attachment_public_dir = _read_attachment_public_dir(config)
         self.max_message_length: int | None = None
         self.queue_id: str | None = None
         self.last_event_id: int | None = None
         self.event_queue_longpoll_timeout_seconds = DEFAULT_LONGPOLL_TIMEOUT_SECONDS
         self.bot_user_id: str | None = None
-        self.bot_full_name: str | None = None
+        self.bot_full_name: str | None = _clean_text(
+            _read_setting(self.config, "ZULIP_BOT_FULL_NAME", "bot_full_name")
+            or _read_setting(self.config, "ZULIP_BOT_NAME", "bot_name")
+            or _read_setting(self.config, "ZULIP_DISPLAY_NAME", "display_name")
+        ) or None
         self.bot_avatar_url: str | None = None
         self._client: Any | None = None
         self._poll_task: asyncio.Task | None = None
         self._stop_polling: asyncio.Event | None = None
         self._approval_reactions: dict[str, dict[str, str]] = {}
 
-    async def connect(self) -> bool:
+    async def connect(self, *, is_reconnect: bool = False) -> bool:
         """Create the Zulip HTTP client, register an event queue, and start polling."""
         if not all((self.site_url, self.bot_email, self.api_key)):
             logger.error("Zulip connection requires site URL, bot email, and API key")
@@ -431,7 +488,13 @@ class ZulipAdapter(BasePlatformAdapter):
 
         self._poll_task = asyncio.create_task(self._poll_loop(), name="zulip-event-poll")
         self._mark_adapter_connected()
-        logger.info("Connected Zulip adapter to %s", self.site_url)
+        logger.info(
+            "Connected Zulip adapter for bot %s (%s) to %s (respond_to_all_authorized_stream_messages=%s)",
+            self.bot_email,
+            self.bot_full_name or "unknown name",
+            self.site_url,
+            self.respond_to_all_authorized_stream_messages,
+        )
         return True
 
     async def disconnect(self) -> None:
@@ -485,6 +548,97 @@ class ZulipAdapter(BasePlatformAdapter):
 
         return _send_result(True, message_id=last_message_id)
 
+    async def send_document(
+        self,
+        chat_id: str,
+        file_path: str,
+        caption: str | None = None,
+        file_name: str | None = None,
+        reply_to: str | None = None,
+        metadata: dict[str, Any] | None = None,
+        **kwargs: Any,
+    ) -> SendResult:
+        """Upload a local file to Zulip and send it as a clickable attachment link."""
+        return await self._send_uploaded_file(
+            chat_id=chat_id,
+            file_path=file_path,
+            caption=caption,
+            file_name=file_name,
+            reply_to=reply_to,
+            metadata=metadata,
+        )
+
+    async def send_image_file(
+        self,
+        chat_id: str,
+        image_path: str,
+        caption: str | None = None,
+        reply_to: str | None = None,
+        metadata: dict[str, Any] | None = None,
+        **kwargs: Any,
+    ) -> SendResult:
+        """Upload a local image to Zulip and send it as a clickable attachment link."""
+        return await self._send_uploaded_file(
+            chat_id=chat_id,
+            file_path=image_path,
+            caption=caption,
+            reply_to=reply_to,
+            metadata=metadata,
+        )
+
+    async def _send_uploaded_file(
+        self,
+        *,
+        chat_id: str,
+        file_path: str,
+        caption: str | None = None,
+        file_name: str | None = None,
+        reply_to: str | None = None,
+        metadata: dict[str, Any] | None = None,
+    ) -> SendResult:
+        if self._client is None:
+            return _send_result(False, "Zulip HTTP client is not initialized")
+
+        path = Path(file_path).expanduser()
+        try:
+            path = path.resolve(strict=True)
+        except Exception as exc:
+            return _send_result(False, f"Zulip attachment path is not readable: {_short_error(exc)}")
+        if not path.is_file():
+            return _send_result(False, f"Zulip attachment path is not a file: {path}")
+
+        display_name = file_name or path.name
+        content_type = mimetypes.guess_type(display_name)[0] or "application/octet-stream"
+        try:
+            with path.open("rb") as fh:
+                response = await self._client.post(
+                    f"{self.api_base}/user_uploads",
+                    files={"file": (display_name, fh, content_type)},
+                )
+            self._raise_for_status(response)
+            body = response.json()
+            if body.get("result") != "success":
+                reason = body.get("msg") or body.get("code") or "Zulip upload failed"
+                logger.error("Zulip upload failed: %s", reason)
+                return _send_result(False, reason)
+            uri = _clean_text(body.get("uri"))
+            if not uri:
+                return _send_result(False, "Zulip upload did not return a file URI")
+        except Exception as exc:
+            reason = _short_error(exc)
+            logger.error("Zulip upload failed: %s", reason)
+            return _send_result(False, reason)
+
+        label = self._markdown_link_label(display_name)
+        content = f"[{label}]({uri})"
+        if caption:
+            content = f"{caption}\n{content}"
+        return await self.send(chat_id=chat_id, content=content, reply_to=reply_to, metadata=metadata)
+
+    @staticmethod
+    def _markdown_link_label(value: str) -> str:
+        return _clean_text(value).replace("\\", "\\\\").replace("]", r"\]").replace("[", r"\[") or "file"
+
 
     async def send_exec_approval(
         self,
@@ -493,6 +647,9 @@ class ZulipAdapter(BasePlatformAdapter):
         session_key: str,
         description: str = "dangerous command",
         metadata: dict[str, Any] | None = None,
+        allow_permanent: bool = True,
+        allow_session: bool = True,
+        smart_denied: bool = False,
     ) -> SendResult:
         """Send a Zulip approval prompt resolved by emoji reactions.
 
@@ -511,7 +668,7 @@ class ZulipAdapter(BasePlatformAdapter):
             f"```\n{cmd_preview}\n```\n"
             f"Reason: {description}\n\n"
             f"React: {options}\n"
-            "Text fallback: `/approve`, `/approve all`, or `/deny`."
+            "Text fallback: `/approve`, `/approve session`, `/approve all`, or `/deny`."
         )
         result = await self.send(chat_id, content, metadata=metadata)
         if not getattr(result, "success", False):
@@ -640,8 +797,25 @@ class ZulipAdapter(BasePlatformAdapter):
                 self.max_message_chars = max_message_length
 
         self._store_bot_identity(payload)
+        await self._load_bot_identity()
         logger.info("Registered Zulip event queue")
         return payload
+
+    async def _load_bot_identity(self) -> None:
+        """Fetch bot identity fields not included in Zulip register payloads."""
+        if self._client is None:
+            return
+        try:
+            response = await self._client.get(f"{self.api_base}/users/me")
+            self._raise_for_status(response)
+            payload = response.json()
+        except Exception as exc:
+            logger.info("Unable to fetch Zulip bot identity: %s", _short_error(exc))
+            return
+        if payload.get("result") == "error":
+            logger.info("Unable to fetch Zulip bot identity: %s", payload.get("msg") or payload.get("code"))
+            return
+        self._store_bot_identity(payload)
 
     async def _poll_loop(self) -> None:
         """Long-poll Zulip events until disconnected."""
@@ -670,7 +844,7 @@ class ZulipAdapter(BasePlatformAdapter):
             timeout=self.event_queue_longpoll_timeout_seconds + 10,
         )
         if self._is_stale_event_queue_response(response):
-            logger.warning("Zulip event queue expired or was rejected; registering a fresh queue")
+            logger.info("Zulip event stream queue expired; registering a fresh event queue")
             await self._register_event_queue()
             return
         self._raise_for_status(response)
@@ -678,7 +852,7 @@ class ZulipAdapter(BasePlatformAdapter):
 
         if payload.get("result") == "error":
             if self._is_stale_event_queue_payload(payload):
-                logger.warning("Zulip event queue expired; registering a fresh queue")
+                logger.info("Zulip event stream queue expired; registering a fresh event queue")
                 await self._register_event_queue()
                 return
             raise RuntimeError(payload.get("msg") or payload.get("code") or "Zulip events failed")
@@ -709,6 +883,13 @@ class ZulipAdapter(BasePlatformAdapter):
         if not isinstance(message, dict):
             return
         if self._is_self_message(message):
+            return
+        if self._is_bot_message(message):
+            logger.info(
+                "Ignoring Zulip bot message id=%s sender_id=%s",
+                message.get("id"),
+                message.get("sender_id"),
+            )
             return
 
         message_kind = _clean_text(message.get("type")).lower()
@@ -924,6 +1105,9 @@ class ZulipAdapter(BasePlatformAdapter):
             or self.bot_avatar_url
         )
 
+    def _is_bot_message(self, message: dict[str, Any]) -> bool:
+        return message.get("sender_is_bot") is True or message.get("is_bot") is True
+
     def _is_authorized(self, message: dict[str, Any]) -> bool:
         """Return true only when the sender matches a configured Zulip allowlist."""
         if not self.allowed_emails and not self.allowed_user_ids:
@@ -979,25 +1163,45 @@ class ZulipAdapter(BasePlatformAdapter):
         if self._has_bot_mention(message, content):
             return True, self._strip_leading_bot_mention(content)
 
-        return True, content
+        leading_mention = LEADING_ZULIP_MENTION_RE.match(content)
+        if leading_mention:
+            logger.info(
+                "Ignoring Zulip stream message id=%s targeted at another bot: %s",
+                message.get("id"),
+                leading_mention.group("name"),
+            )
+            return False, content
+
+        if self.respond_to_all_authorized_stream_messages:
+            logger.info(
+                "Accepting Zulip stream message id=%s from authorized sender without explicit bot mention/reply",
+                message.get("id"),
+            )
+            return True, content
+
+        logger.info(
+            "Ignoring Zulip stream message id=%s without explicit bot mention/reply",
+            message.get("id"),
+        )
+        return False, content
 
     def _has_bot_mention(self, message: dict[str, Any], content: str) -> bool:
+        match = LEADING_ZULIP_MENTION_RE.match(content)
+        if match:
+            return self._is_known_bot_name(match.group("name"))
+
+        known_names = [re.escape(name) for name in self._bot_mention_names() if name]
+        if known_names and re.search(r"@\*\*(?:" + "|".join(known_names) + r")\*\*", content, re.IGNORECASE):
+            return True
+
         flags = {
             _clean_text(flag).lower()
             for flag in (message.get("flags") or [])
             if _clean_text(flag)
         }
-        if flags & MENTION_FLAGS:
-            return True
-
-        match = LEADING_ZULIP_MENTION_RE.match(content)
-        if match and self._is_known_bot_name(match.group("name")):
-            return True
-
-        known_names = [re.escape(name) for name in self._bot_mention_names() if name]
-        if not known_names:
-            return False
-        return re.search(r"@\*\*(?:" + "|".join(known_names) + r")\*\*", content, re.IGNORECASE) is not None
+        # Zulip's `mentioned` flag is scoped to this bot/user. Do not accept
+        # `wildcard_mentioned`: @all/@channel should not wake every profile bot.
+        return "mentioned" in flags
 
     def _strip_leading_bot_mention(self, content: str) -> str:
         match = LEADING_ZULIP_MENTION_RE.match(content)
@@ -1012,14 +1216,13 @@ class ZulipAdapter(BasePlatformAdapter):
         return bool(normalized and normalized in {_normalize_name(item) for item in self._bot_mention_names()})
 
     def _bot_mention_names(self) -> set[str]:
-        extra = _extra(self.config)
         local_part = self.bot_email.split("@", 1)[0] if self.bot_email else ""
         local_words = re.sub(r"[._-]+", " ", local_part).strip()
         names = {
             self.bot_full_name or "",
-            extra.get("bot_full_name") or "",
-            extra.get("bot_name") or "",
-            extra.get("display_name") or "",
+            _read_setting(self.config, "ZULIP_BOT_FULL_NAME", "bot_full_name") or "",
+            _read_setting(self.config, "ZULIP_BOT_NAME", "bot_name") or "",
+            _read_setting(self.config, "ZULIP_DISPLAY_NAME", "display_name") or "",
             local_part,
             local_words,
         }
@@ -1085,9 +1288,18 @@ class ZulipAdapter(BasePlatformAdapter):
             target_path = target_dir / filename
             target_path.write_bytes(body)
             media_type = self._attachment_media_type(filename, response)
-            media_urls.append(str(target_path))
+            public_url = self._publish_attachment_for_external_fetch(
+                target_path,
+                media_type=media_type,
+                message_id=message_id,
+                filename=filename,
+            )
+            media_urls.append(public_url or str(target_path))
             media_types.append(media_type)
-            summaries.append(f"[Attachment: {filename}] {target_path}")
+            if public_url:
+                summaries.append(f"[Image attachment: {filename}] {public_url}")
+            else:
+                summaries.append(f"[Attachment: {filename}] {target_path}")
 
         return {"media_urls": media_urls, "media_types": media_types, "summaries": summaries}
 
@@ -1130,6 +1342,46 @@ class ZulipAdapter(BasePlatformAdapter):
             return content_type
         guessed, _ = mimetypes.guess_type(filename)
         return guessed or "application/octet-stream"
+
+    def _publish_attachment_for_external_fetch(
+        self,
+        path: Path,
+        *,
+        media_type: str,
+        message_id: str,
+        filename: str,
+    ) -> str | None:
+        """Copy image attachments to an optional public static directory.
+
+        FAL cannot download Zulip's authenticated /user_uploads URLs or Hermes'
+        local gateway cache paths. When configured, publish only image files to
+        a short public URL and pass that URL as the media attachment reference.
+        Non-images keep the local cache path so document/audio workflows do not
+        change.
+        """
+        if not media_type.startswith("image/"):
+            return None
+        if not self.attachment_public_base_url or self.attachment_public_dir is None:
+            return None
+        try:
+            body = path.read_bytes()
+            digest = hashlib.sha256(body).hexdigest()
+            suffix = Path(filename).suffix.lower()
+            if suffix not in self.attachment_allowed_exts:
+                suffix = mimetypes.guess_extension(media_type) or ""
+            public_name = f"{digest}{suffix}"
+            public_dir = self.attachment_public_dir / "_by_sha256"
+            public_dir.mkdir(parents=True, exist_ok=True)
+            public_path = public_dir / public_name
+            if not public_path.exists():
+                public_path.write_bytes(body)
+            return (
+                f"{self.attachment_public_base_url}/"
+                f"_by_sha256/{quote(public_name)}"
+            )
+        except Exception as exc:
+            logger.warning("Failed to publish Zulip attachment for external fetch: %s", exc)
+            return None
 
     def _build_message_event(
         self,

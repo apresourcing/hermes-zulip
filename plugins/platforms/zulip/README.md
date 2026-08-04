@@ -34,6 +34,8 @@ The allowlist variables are metadata-optional because either one can satisfy the
 
 Optional:
 
+- `ZULIP_BOT_FULL_NAME` (or aliases `ZULIP_BOT_NAME`, `ZULIP_DISPLAY_NAME`): the bot's Zulip display name used for mention matching. Set this per profile when running multiple Hermes bots in the same organization so `@**Hermes Product Manager**` is only recognized by that profile and ignored by the others. The adapter also fetches the bot's identity from `/users/me` on connect as a fallback.
+- `ZULIP_RESPOND_TO_ALL_AUTHORIZED_STREAM_MESSAGES`: when truthy (`1`, `true`, `yes`, `on`), the bot responds to every stream/topic message from an authorized sender without requiring an `@bot` mention. Defaults to off.
 - `ZULIP_HOME_CHANNEL`: Zulip chat target for home, cron, or background delivery. This is the value saved by `/sethome`, e.g. `dm_user:12345` or `stream:12345:topic:Example%20topic`.
 - `ZULIP_HOME_EMAIL`: legacy Zulip DM email target for home, cron, or background delivery when `ZULIP_HOME_CHANNEL` is unset.
 - `ZULIP_HOME_USER_ID`: legacy Zulip DM user ID target for home, cron, or background delivery when `ZULIP_HOME_CHANNEL` is unset.
@@ -41,6 +43,8 @@ Optional:
 - `ZULIP_ATTACHMENT_MAX_BYTES`: maximum downloaded attachment size. Defaults to 25 MB.
 - `ZULIP_ATTACHMENT_MAX_COUNT`: maximum attachments to materialize from one message. Defaults to 5.
 - `ZULIP_ATTACHMENT_ALLOWED_EXTS`: comma-separated list of allowed attachment extensions. Defaults to common image, document, and text formats.
+- `ZULIP_ATTACHMENT_PUBLIC_BASE_URL`: optional public base URL for image attachments that external services (such as FAL) can fetch. When set together with `ZULIP_ATTACHMENT_PUBLIC_DIR`, inbound images are also mirrored to a content-addressed path under `{public_dir}/_by_sha256/<digest><ext>` and exposed as `{public_base_url}/_by_sha256/<digest><ext>`.
+- `ZULIP_ATTACHMENT_PUBLIC_DIR`: optional local directory served by the public base URL for image attachments. Pairs with `ZULIP_ATTACHMENT_PUBLIC_BASE_URL`.
 
 If no home variable is configured, inbound Zulip still works, but default Zulip delivery has no home target.
 
@@ -48,14 +52,17 @@ If no home variable is configured, inbound Zulip still works, but default Zulip 
 
 - Uses the Zulip bot account only, authenticated with `ZULIP_BOT_EMAIL` and `ZULIP_API_KEY`.
 - Registers a Zulip Events API queue for message and reaction events and polls it with long polling.
+- Fetches the bot's identity from `/users/me` after registration so display-name mention matching works even when the register payload omits it.
 - Accepts DMs from allowed Zulip users.
-- Accepts stream/topic messages from allowed Zulip users. If the message starts with a bot mention, the adapter strips that mention before handing the message to Hermes.
+- Accepts stream/topic messages from allowed Zulip users when either the message starts with this bot's mention or `ZULIP_RESPOND_TO_ALL_AUTHORIZED_STREAM_MESSAGES` is enabled. If the invocation starts with a *different* bot's mention, the adapter ignores it so multiple Hermes bot profiles can share a stream without double-replying. When the invocation starts with this bot's mention, the adapter strips it before handing the message to Hermes.
+- Ignores messages authored by other bots to avoid loops.
 - Maps each Zulip stream plus topic to a separate Hermes conversation. Different topics in the same stream do not share context.
-- Sends and receives Markdown text.
+- Sends and receives Markdown text, plus supported inbound and outbound file/image attachments. Outbound files are uploaded via `/user_uploads` and delivered as clickable Markdown links; use `send_document` for arbitrary files and `send_image_file` for images.
 - Splits long Hermes replies in the same Zulip DM or stream/topic rather than moving the reply elsewhere.
 - Sends Zulip typing indicators when Hermes starts and stops typing.
-- Downloads supported Zulip `/user_uploads/` attachments into Hermes' gateway incoming cache and exposes their local paths as media URLs.
-- Supports Zulip reaction approvals for dangerous command prompts.
+- Downloads supported Zulip `/user_uploads/` attachments into Hermes' gateway incoming cache and exposes their local paths as media URLs. When `ZULIP_ATTACHMENT_PUBLIC_BASE_URL` and `ZULIP_ATTACHMENT_PUBLIC_DIR` are configured, image attachments are also mirrored to a content-addressed public URL so external services can fetch them.
+- Supports Zulip reaction approvals for dangerous command prompts: 👍 approve once, ✅ approve for this session, ♾️ approve all pending matching approvals, 👎 reject. Text fallbacks are `/approve`, `/approve session`, `/approve all`, `/deny`.
+- Recovers gracefully from stale event queues after a Zulip-side reset by re-registering on reconnect.
 - Does not replay backlog after adapter restart. A fresh Events API queue is registered and only new events are processed.
 - Delivers home, cron, and standalone sends to the configured Zulip target.
 
@@ -66,6 +73,7 @@ Unauthorized DMs receive a short denial message. Unauthorized stream messages ar
 - The plugin fails closed when no sender allowlist is configured.
 - Logs use short error messages and avoid logging API keys or full message bodies on authorization failures.
 - Attachment downloads are limited to same-site Zulip `/user_uploads/` URLs, sanitized filenames, configured size caps, count caps, and extension allowlists.
+- The optional public attachment mirror only exposes image files, uses SHA-256 content-addressed filenames, and only activates when both `ZULIP_ATTACHMENT_PUBLIC_BASE_URL` and `ZULIP_ATTACHMENT_PUBLIC_DIR` are set.
 - Store secrets in your Hermes environment, not in this repository.
 
 ## Testing
