@@ -1093,8 +1093,21 @@ async def test_attachment_download_rejects_external_and_oversized_files(
 
 
 @pytest.mark.asyncio
-async def test_stream_without_mention_and_bare_slash_command_are_accepted(adapter_module):
+async def test_stream_without_mention_ignored_by_default(adapter_module):
     adapter = _make_recording_adapter(adapter_module)
+
+    await adapter._handle_zulip_message_event(_message_event(_stream_message(content="hello")))
+    await adapter._handle_zulip_message_event(_message_event(_stream_message(id=1002, content="/status")))
+
+    assert adapter.events == []
+
+
+@pytest.mark.asyncio
+async def test_stream_without_mention_accepted_when_respond_to_all_enabled(adapter_module):
+    adapter = _make_recording_adapter(
+        adapter_module,
+        extra={"respond_to_all_authorized_stream_messages": True},
+    )
 
     await adapter._handle_zulip_message_event(_message_event(_stream_message(content="hello")))
     await adapter._handle_zulip_message_event(_message_event(_stream_message(id=1002, content="/status")))

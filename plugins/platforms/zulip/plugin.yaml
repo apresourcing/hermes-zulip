@@ -26,6 +26,22 @@ optional_env:
     description: "Comma-separated Zulip sender user IDs allowed to use Hermes"
     prompt: "Allowed Zulip user IDs"
     password: false
+  - name: ZULIP_BOT_FULL_NAME
+    description: "Zulip bot display name used for mention matching (e.g. 'Hermes Product Manager'). Configure per profile when multiple Hermes bots share a stream."
+    prompt: "Zulip bot full name"
+    password: false
+  - name: ZULIP_BOT_NAME
+    description: "Alias for ZULIP_BOT_FULL_NAME"
+    prompt: "Zulip bot name"
+    password: false
+  - name: ZULIP_DISPLAY_NAME
+    description: "Alias for ZULIP_BOT_FULL_NAME"
+    prompt: "Zulip display name"
+    password: false
+  - name: ZULIP_RESPOND_TO_ALL_AUTHORIZED_STREAM_MESSAGES
+    description: "When truthy (1/true/yes/on), respond to every stream message from an authorized sender without requiring an @bot mention"
+    prompt: "Respond to all authorized stream messages"
+    password: false
   - name: ZULIP_HOME_CHANNEL
     description: "Default Zulip chat_id for cron/background delivery, e.g. dm_user:12345 or stream:12345:topic:Example%20topic"
     prompt: "Zulip home channel"
@@ -53,4 +69,12 @@ optional_env:
   - name: ZULIP_ATTACHMENT_ALLOWED_EXTS
     description: "Comma-separated list of allowed attachment extensions"
     prompt: "Zulip attachment allowed extensions"
+    password: false
+  - name: ZULIP_ATTACHMENT_PUBLIC_BASE_URL
+    description: "Optional public base URL for image attachments that external services (such as FAL) can fetch"
+    prompt: "Zulip attachment public base URL"
+    password: false
+  - name: ZULIP_ATTACHMENT_PUBLIC_DIR
+    description: "Optional local directory served by the public base URL for image attachments"
+    prompt: "Zulip attachment public directory"
     password: false
