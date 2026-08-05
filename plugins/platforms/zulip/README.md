@@ -68,6 +68,25 @@ If no home variable is configured, inbound Zulip still works, but default Zulip 
 
 Unauthorized DMs receive a short denial message. Unauthorized stream messages are ignored without posting to the stream.
 
+## Multi-profile multiplexing
+
+The plugin supports `gateway.multiplex_profiles: true`, where one gateway process serves every Hermes profile. The intended pattern is **one Zulip bot account per profile**:
+
+- Create one bot in your Zulip organization per profile (e.g. "Hermes Dev", "Hermes Marketing").
+- Put that bot's `ZULIP_SITE_URL`, `ZULIP_BOT_EMAIL`, `ZULIP_API_KEY`, allowlists, `ZULIP_BOT_FULL_NAME`, and optional `ZULIP_HOME_CHANNEL` in the profile's own `~/.hermes/profiles/<name>/.env`.
+- Install the plugin once, in the default profile's `~/.hermes/plugins/zulip/` — plugin discovery is process-wide, so one install serves all profiles.
+- Restart the default gateway. It brings up one Zulip adapter per profile, each long-polling its own bot's event queue.
+
+Environment resolution is secret-scope aware: under multiplexing each profile's `.env` values are read through the gateway's per-profile secret scope, never from the shared process environment, so credentials cannot leak between profiles. Two profiles configured with the same Zulip bot credential are refused at startup instead of double-polling. Inbound attachments are cached under the owning profile's own Hermes home.
+
+To chat with a specific agent, DM its bot, or mention it in a stream (`@**Hermes Dev** status?`). Multiple profile bots can share a stream: each only responds to its own mention, ignores invocations aimed at another bot, and does not wake on `@all`/`@channel`.
+
+Caveats:
+
+- Do not put two profile bots in one group DM — DMs have no mention gating, so every bot in the group replies.
+- Only enable `ZULIP_RESPOND_TO_ALL_AUTHORIZED_STREAM_MESSAGES` for a profile whose bot has its own dedicated stream; two bots with it enabled in a shared stream both reply to everything.
+- Agent-to-agent chat over Zulip stays blocked: messages authored by other bots are ignored to avoid loops.
+
 ## Security notes
 
 - The plugin fails closed when no sender allowlist is configured.
