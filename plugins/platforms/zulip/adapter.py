@@ -128,9 +128,40 @@ def _extra(config: Any) -> dict[str, Any]:
     return extra if isinstance(extra, dict) else {}
 
 
+def _env_get(name: str) -> str | None:
+    """Read an env-backed setting honoring the active profile's secret scope.
+
+    Under ``gateway.multiplex_profiles`` each profile's ``.env`` lives in a
+    context-local secret scope, never in ``os.environ`` — a bare environ read
+    would resolve the default profile's Zulip credentials for every profile.
+    ``get_secret`` is scope-aware; an *unscoped* read under multiplexing (the
+    default-profile startup loop) raises ``UnscopedSecretError``, and in that
+    context ``os.environ`` holds that profile's own values, so fall back to it.
+    """
+    try:
+        from agent.secret_scope import UnscopedSecretError, get_secret
+    except ImportError:  # pragma: no cover - pre-multiplex Hermes checkouts
+        return os.environ.get(name)
+    try:
+        return get_secret(name)
+    except UnscopedSecretError:
+        return os.environ.get(name)
+
+
+def _hermes_home() -> Path:
+    """Resolve the active profile's Hermes home, honoring multiplex overrides."""
+    try:
+        from hermes_constants import get_hermes_home
+
+        return Path(get_hermes_home())
+    except Exception:
+        return Path(os.environ.get("HERMES_HOME") or str(Path.home() / ".hermes"))
+
+
 def _read_setting(config: Any, env_name: str, extra_name: str) -> Any:
-    if env_name in os.environ:
-        return os.environ[env_name]
+    value = _env_get(env_name)
+    if value is not None:
+        return value
     return _extra(config).get(extra_name)
 
 
@@ -204,7 +235,7 @@ def _read_max_message_chars(config: Any) -> int:
 
 
 def _read_configured_max_message_chars(config: Any) -> int | None:
-    env_value = os.environ.get("ZULIP_MAX_MESSAGE_CHARS")
+    env_value = _env_get("ZULIP_MAX_MESSAGE_CHARS")
     if env_value is not None:
         parsed = _parse_positive_int(env_value)
         if parsed is not None:
@@ -214,7 +245,7 @@ def _read_configured_max_message_chars(config: Any) -> int | None:
 
 
 def _read_attachment_max_bytes(config: Any) -> int:
-    env_value = os.environ.get("ZULIP_ATTACHMENT_MAX_BYTES")
+    env_value = _env_get("ZULIP_ATTACHMENT_MAX_BYTES")
     if env_value is not None:
         parsed = _parse_positive_int(env_value)
         if parsed is not None:
@@ -224,7 +255,7 @@ def _read_attachment_max_bytes(config: Any) -> int:
 
 
 def _read_attachment_max_count(config: Any) -> int:
-    env_value = os.environ.get("ZULIP_ATTACHMENT_MAX_COUNT")
+    env_value = _env_get("ZULIP_ATTACHMENT_MAX_COUNT")
     if env_value is not None:
         parsed = _parse_positive_int(env_value)
         if parsed is not None:
@@ -263,13 +294,15 @@ def _read_attachment_public_dir(config: Any) -> Path | None:
 
 def _read_legacy_home_target(config: Any) -> tuple[str | None, str | None]:
     extra = _extra(config)
-    if "ZULIP_HOME_EMAIL" in os.environ:
-        home_email = _clean_text(os.environ.get("ZULIP_HOME_EMAIL"))
+    env_home_email = _env_get("ZULIP_HOME_EMAIL")
+    if env_home_email is not None:
+        home_email = _clean_text(env_home_email)
     else:
         home_email = _clean_text(extra.get("home_email"))
 
-    if "ZULIP_HOME_USER_ID" in os.environ:
-        home_user_id = _clean_text(os.environ.get("ZULIP_HOME_USER_ID"))
+    env_home_user_id = _env_get("ZULIP_HOME_USER_ID")
+    if env_home_user_id is not None:
+        home_user_id = _clean_text(env_home_user_id)
     else:
         home_user_id = _clean_text(extra.get("home_user_id"))
 
@@ -286,8 +319,9 @@ def _home_channel(home_email: str | None, home_user_id: str | None) -> dict[str,
 
 def _read_home_channel(config: Any) -> dict[str, str] | None:
     extra = _extra(config)
-    if "ZULIP_HOME_CHANNEL" in os.environ:
-        chat_id = _clean_text(os.environ.get("ZULIP_HOME_CHANNEL"))
+    env_home_channel = _env_get("ZULIP_HOME_CHANNEL")
+    if env_home_channel is not None:
+        chat_id = _clean_text(env_home_channel)
         if chat_id:
             return {"chat_id": chat_id, "name": "Zulip Home"}
 
@@ -430,6 +464,12 @@ class ZulipAdapter(BasePlatformAdapter):
             self.platform = platform
         self.config = config
         self.site_url, self.bot_email, self.api_key = _read_required(config)
+        # Read by the gateway's same-credential fingerprint so multiplexed
+        # profiles configured with the same Zulip bot are refused at startup
+        # instead of double-polling and double-replying.
+        self.api_token = (
+            f"{self.site_url}|{self.bot_email}|{self.api_key}" if self.api_key else None
+        )
         self.api_base = f"{self.site_url}/api/v1" if self.site_url else ""
         self.allowed_emails = _read_allowed_emails(config)
         self.allowed_user_ids = _read_allowed_user_ids(config)
@@ -1331,8 +1371,7 @@ class ZulipAdapter(BasePlatformAdapter):
     @staticmethod
     def _attachment_cache_dir(message_id: str) -> Path:
         safe_message_id = re.sub(r"[^A-Za-z0-9._-]+", "_", message_id).strip("._") or "unknown"
-        hermes_home = Path(os.environ.get("HERMES_HOME") or str(Path.home() / ".hermes"))
-        return hermes_home / "gateway" / "incoming" / "zulip" / safe_message_id
+        return _hermes_home() / "gateway" / "incoming" / "zulip" / safe_message_id
 
     @staticmethod
     def _attachment_media_type(filename: str, response: Any) -> str:
@@ -1662,7 +1701,7 @@ def _env_enablement() -> dict[str, Any] | None:
         "allowed_user_ids": sorted(_read_allowed_user_ids(config)),
     }
 
-    max_message_chars = _parse_positive_int(os.environ.get("ZULIP_MAX_MESSAGE_CHARS"))
+    max_message_chars = _parse_positive_int(_env_get("ZULIP_MAX_MESSAGE_CHARS"))
     if max_message_chars is not None:
         extra["max_message_chars"] = max_message_chars
 

@@ -15,6 +15,7 @@ I'm not going to be following the normal OSS route for this. No issues, I won't 
 - Fail-closed inbound authorization with email or user-ID allowlists
 - Zulip DM and stream/topic conversations
 - Multi-profile mention routing: each Hermes bot only responds to its own `ZULIP_BOT_FULL_NAME` mention when several share a stream
+- Multiplexing support (`gateway.multiplex_profiles`): one gateway serves many profiles, each with its own Zulip bot, resolved through the per-profile secret scope
 - Optional "respond to all authorized stream messages" mode for dedicated bot streams
 - Markdown replies with long-message splitting
 - Home, cron, and background delivery through `ZULIP_HOME_CHANNEL`

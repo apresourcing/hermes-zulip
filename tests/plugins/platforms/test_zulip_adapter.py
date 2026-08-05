@@ -1540,3 +1540,123 @@ async def test_standalone_sender_fails_clearly_without_home_target(
         "success": False,
         "error": "Zulip home DM is not configured",
     }
+
+
+def _install_fake_secret_scope(monkeypatch, secrets, *, unscoped_error=False):
+    agent_module = types.ModuleType("agent")
+    scope_module = types.ModuleType("agent.secret_scope")
+
+    class UnscopedSecretError(RuntimeError):
+        pass
+
+    def get_secret(name, default=None):
+        if unscoped_error:
+            raise UnscopedSecretError(name)
+        return secrets.get(name, default)
+
+    scope_module.UnscopedSecretError = UnscopedSecretError
+    scope_module.get_secret = get_secret
+    monkeypatch.setitem(sys.modules, "agent", agent_module)
+    monkeypatch.setitem(sys.modules, "agent.secret_scope", scope_module)
+
+
+def test_secret_scope_values_override_process_env(adapter_module, monkeypatch):
+    _set_base_env(monkeypatch)
+    monkeypatch.setenv("ZULIP_ALLOWED_EMAILS", "default@example.com")
+    monkeypatch.setenv("ZULIP_HOME_CHANNEL", "dm_user:1")
+    _install_fake_secret_scope(
+        monkeypatch,
+        {
+            "ZULIP_SITE_URL": "https://profile.zulipchat.com/",
+            "ZULIP_BOT_EMAIL": "profile-bot@example.com",
+            "ZULIP_API_KEY": "profile-key",  # pragma: allowlist secret
+            "ZULIP_ALLOWED_EMAILS": "profile-user@example.com",
+            "ZULIP_HOME_CHANNEL": "dm_user:42",
+            "ZULIP_BOT_FULL_NAME": "Hermes Marketing",
+        },
+    )
+
+    adapter = adapter_module.ZulipAdapter(FakePlatformConfig())
+
+    assert adapter.site_url == "https://profile.zulipchat.com"
+    assert adapter.bot_email == "profile-bot@example.com"
+    assert adapter.api_key == "profile-key"  # pragma: allowlist secret
+    assert adapter.allowed_emails == {"profile-user@example.com"}
+    assert adapter.home_channel == {"chat_id": "dm_user:42", "name": "Zulip Home"}
+    assert adapter.bot_full_name == "Hermes Marketing"
+
+
+def test_secret_scope_misses_do_not_leak_process_env(adapter_module, monkeypatch):
+    _set_base_env(monkeypatch)
+    monkeypatch.setenv("ZULIP_ALLOWED_EMAILS", "default@example.com")
+    _install_fake_secret_scope(
+        monkeypatch,
+        {
+            "ZULIP_SITE_URL": "https://profile.zulipchat.com/",
+            "ZULIP_BOT_EMAIL": "profile-bot@example.com",
+            "ZULIP_API_KEY": "profile-key",  # pragma: allowlist secret
+        },
+    )
+
+    adapter = adapter_module.ZulipAdapter(FakePlatformConfig())
+
+    assert adapter.allowed_emails == set()
+    assert adapter.home_channel is None
+
+
+def test_secret_scope_enables_platform_without_process_env(adapter_module, monkeypatch):
+    _install_fake_secret_scope(
+        monkeypatch,
+        {
+            "ZULIP_SITE_URL": "https://profile.zulipchat.com/",
+            "ZULIP_BOT_EMAIL": "profile-bot@example.com",
+            "ZULIP_API_KEY": "profile-key",  # pragma: allowlist secret
+            "ZULIP_ALLOWED_USER_IDS": "42",
+        },
+    )
+
+    extra = adapter_module._env_enablement()
+
+    assert extra is not None
+    assert extra["site_url"] == "https://profile.zulipchat.com"
+    assert extra["bot_email"] == "profile-bot@example.com"
+    assert extra["allowed_user_ids"] == ["42"]
+
+
+def test_unscoped_secret_error_falls_back_to_process_env(adapter_module, monkeypatch):
+    _set_base_env(monkeypatch)
+    monkeypatch.setenv("ZULIP_ALLOWED_EMAILS", "default@example.com")
+    _install_fake_secret_scope(monkeypatch, {}, unscoped_error=True)
+
+    adapter = adapter_module.ZulipAdapter(FakePlatformConfig())
+
+    assert adapter.site_url == "https://example.zulipchat.com"
+    assert adapter.bot_email == "bot@example.com"
+    assert adapter.allowed_emails == {"default@example.com"}
+
+
+def test_api_token_exposes_credential_fingerprint_material(adapter_module):
+    adapter = _make_adapter(adapter_module)
+
+    assert adapter.api_token == (
+        "https://example.zulipchat.com|bot@example.com|test-api-key"
+    )
+
+
+def test_api_token_is_none_without_credentials(adapter_module):
+    adapter = adapter_module.ZulipAdapter(FakePlatformConfig())
+
+    assert adapter.api_token is None
+
+
+def test_attachment_cache_dir_uses_profile_hermes_home(adapter_module, monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "default"))
+    constants_module = types.ModuleType("hermes_constants")
+    constants_module.get_hermes_home = lambda: tmp_path / "profiles" / "marketing"
+    monkeypatch.setitem(sys.modules, "hermes_constants", constants_module)
+
+    cache_dir = adapter_module.ZulipAdapter._attachment_cache_dir("123")
+
+    assert cache_dir == (
+        tmp_path / "profiles" / "marketing" / "gateway" / "incoming" / "zulip" / "123"
+    )

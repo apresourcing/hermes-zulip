@@ -66,7 +66,7 @@ def test_zulip_plugin_metadata_identifies_platform():
     assert metadata["name"] == "zulip-platform"
     assert metadata["label"] == "Zulip"
     assert metadata["kind"] == "platform"
-    assert metadata["version"] == "1.0.0"
+    assert metadata["version"] == "1.1.0"
     assert metadata["description"]
     assert metadata["author"]
 

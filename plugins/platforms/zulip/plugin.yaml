@@ -1,7 +1,7 @@
 name: zulip-platform
 label: Zulip
 kind: platform
-version: 1.0.0
+version: 1.1.0
 description: Zulip gateway adapter for Hermes Agent using the Zulip Events API.
 author: Nous Research / contributor
 requires_env:
